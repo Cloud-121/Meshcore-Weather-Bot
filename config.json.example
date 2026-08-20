@@ -1,0 +1,21 @@
+{
+  "repeater_host": "127.0.0.1",
+  "repeater_port": 5001,
+  "bot_name": "WeatherBot",
+
+  "weather_channel_index": 1,
+  "weather_channel_name": "Weather",
+  "weather_channel_key": "",
+
+  "alert_zip_codes": ["60601", "63101"],
+  "alert_poll_seconds": 60,
+
+  "direct_retries": 3,
+  "ack_timeout_seconds": 5,
+  "reconnect_seconds": 5,
+  "http_timeout_seconds": 15,
+
+  "noaa_user_agent": "pymc-weatherbot/1.0 (your-email@example.com)",
+  "state_file": ".weatherbot_state.json",
+  "log_level": "INFO"
+}
