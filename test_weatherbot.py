@@ -31,6 +31,7 @@ def make_config(state_file, **changes):
         direct_retries=3,
         ack_timeout_seconds=0.001,
         reconnect_seconds=1,
+        request_dedup_seconds=120,
         http_timeout_seconds=1,
         noaa_user_agent="weatherbot-tests (tests@example.com)",
         state_file=Path(state_file),
@@ -122,6 +123,73 @@ class WeatherFormattingTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(len(chunks), 1)
         self.assertIn("\n", chunks[0])
 
+    async def test_split_mesh_text_reconstructs_long_text(self):
+        text = "\n".join(
+            f"☀️ Line {index} with some padding words here" for index in range(30)
+        )
+        chunks = weatherbot.split_mesh_text(text, 140)
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(len(c.encode("utf-8")) <= 140 for c in chunks))
+        joined = " ".join(chunk.split(" ", 1)[1] for chunk in chunks)
+        self.assertEqual(" ".join(joined.split()), " ".join(text.split()))
+
+    async def test_split_mesh_text_keeps_lines_intact(self):
+        lines = ["Line one is short", "Line two is short too", "Line three here"]
+        text = "\n".join(lines)
+        chunks = weatherbot.split_mesh_text(text, 140)
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0], text)
+
+    async def test_format_channel_alert_keeps_full_description_and_caps(self):
+        long_description = "Description sentence. " * 300
+        alert = {
+            "id": "a1",
+            "properties": {
+                "event": "Heat Advisory",
+                "severity": "Moderate",
+                "urgency": "Expected",
+                "timeZone": "America/Chicago",
+                "headline": "Short headline",
+                "description": long_description,
+                "instruction": "Drink water.",
+                "sent": "2026-08-20T10:00:00-05:00",
+                "expires": "2026-08-20T20:00:00-05:00",
+            },
+        }
+        message = weatherbot.format_channel_alert(alert, ["60601", "60602"])
+        body = message.split("\n", 2)[2]
+        self.assertEqual(len(body), 2000)
+        self.assertTrue(message.startswith("🚨 NWS ALERT — 60601,60602"))
+        self.assertTrue(body.startswith("Description sentence."))
+
+    async def test_format_channel_alert_appends_instruction_when_short(self):
+        alert = {
+            "id": "a3",
+            "properties": {
+                "event": "Heat Advisory",
+                "severity": "Moderate",
+                "urgency": "Expected",
+                "description": "A short warning body.",
+                "instruction": "Drink water.",
+            },
+        }
+        message = weatherbot.format_channel_alert(alert, ["60601"])
+        self.assertIn("A short warning body. Drink water.", message)
+
+    async def test_format_channel_alert_uses_description_over_headline(self):
+        alert = {
+            "id": "a2",
+            "properties": {
+                "event": "Flood Watch",
+                "severity": "Severe",
+                "urgency": "Expected",
+                "description": "The full detailed warning body text.",
+                "headline": "A short headline",
+            },
+        }
+        message = weatherbot.format_channel_alert(alert, ["60601"])
+        self.assertIn("The full detailed warning body text.", message)
+
     async def test_utf8_chunks_fit_mesh_limit(self):
         chunks = weatherbot.split_mesh_text("storm warning " * 100 + "☂", 140)
         self.assertGreater(len(chunks), 1)
@@ -139,11 +207,13 @@ class WeatherFormattingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FakeRoutingCommands:
-    def __init__(self, ack=b"\x12\x34\x56\x78"):
+    def __init__(self, ack=b"\x12\x34\x56\x78", advert_path=None):
         self.ack = ack
         self.attempts = []
         self.reset_contacts = []
         self.path_changes = []
+        self.advert_path_calls = []
+        self.advert_path = advert_path
         self.flood = False
 
     async def send_msg(self, contact, text, timestamp, attempt):
@@ -156,6 +226,12 @@ class FakeRoutingCommands:
                 "suggested_timeout": 1,
             },
         )
+
+    async def get_advert_path(self, contact):
+        self.advert_path_calls.append(contact)
+        if self.advert_path is None:
+            return FakeEvent(EventType.ERROR, {"reason": "no_path"})
+        return FakeEvent(EventType.ADVERT_PATH, self.advert_path)
 
     async def change_contact_path(self, contact, path, path_hash_mode=None):
         self.path_changes.append((contact, path, path_hash_mode))
@@ -205,28 +281,40 @@ class RoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(mesh.commands.attempts), 1)
         self.assertEqual(mesh.commands.reset_contacts, [])
 
-    async def test_newest_received_path_is_reversed_and_applied(self):
+    async def test_advert_path_is_fetched_and_applied_before_send(self):
         with tempfile.TemporaryDirectory() as directory:
             bot, mesh, contact = self.make_bot_and_mesh(directory)
-            bot._recent_rx_paths.append((time.time(), 2, 1, "aabbccdd"))
-            dm = weatherbot.InboundMessage(
-                "wx 60601",
-                sender_prefix="313233343536",
-                path_len=2,
-                path_hash_mode=0,
-            )
-            bot._associate_rx_path(dm)
-            self.assertEqual(bot._rx_paths["313233343536"][:2], ("ddccbbaa", 0))
+            mesh.commands.advert_path = {
+                "path": "aabbcc",
+                "path_len": 2,
+                "path_hash_mode": 0,
+                "timestamp": 123,
+            }
             self.assertTrue(
                 await bot.send_dm_with_fallback(mesh, "313233343536", "weather")
             )
-        self.assertEqual(mesh.commands.path_changes, [(contact, "ddccbbaa", 0)])
+        self.assertEqual(mesh.commands.advert_path_calls, [contact])
+        self.assertEqual(mesh.commands.path_changes, [(contact, "aabbcc", 0)])
+
+    async def test_no_advert_path_leaves_stored_route_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot, mesh, contact = self.make_bot_and_mesh(directory)
+            mesh.commands.advert_path = {
+                "path": "",
+                "path_len": -1,
+                "path_hash_mode": -1,
+            }
+            self.assertTrue(
+                await bot.send_dm_with_fallback(mesh, "313233343536", "weather")
+            )
+        self.assertEqual(mesh.commands.advert_path_calls, [contact])
+        self.assertEqual(mesh.commands.path_changes, [])
 
     async def test_duplicate_dm_is_not_answered_twice(self):
         with tempfile.TemporaryDirectory() as directory:
             bot, mesh, _contact = self.make_bot_and_mesh(directory)
             message = weatherbot.InboundMessage(
-                "wx 60601", sender_prefix="313233343536", sender_timestamp=12345
+                "wx 60601", sender_prefix="313233343536"
             )
             bot._recent_acks.append(mesh.commands.ack.hex())
             self.assertTrue(await bot.handle_message(mesh, message))
@@ -236,11 +324,28 @@ class RoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await bot.handle_message(mesh, message))
             self.assertEqual(len(mesh.commands.attempts), 1)
 
-            newer = weatherbot.InboundMessage(
-                "wx 60601", sender_prefix="313233343536", sender_timestamp=12346
+            other = weatherbot.InboundMessage(
+                "wx 60602", sender_prefix="313233343536"
             )
             bot._recent_acks.append(mesh.commands.ack.hex())
-            self.assertTrue(await bot.handle_message(mesh, newer))
+            self.assertTrue(await bot.handle_message(mesh, other))
+            self.assertEqual(len(mesh.commands.attempts), 2)
+
+    async def test_dedup_window_expiry_allows_new_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot, mesh, _contact = self.make_bot_and_mesh(directory)
+            message = weatherbot.InboundMessage(
+                "wx 60601", sender_prefix="313233343536"
+            )
+            bot._recent_acks.append(mesh.commands.ack.hex())
+            self.assertTrue(await bot.handle_message(mesh, message))
+            self.assertEqual(len(mesh.commands.attempts), 1)
+
+            key = bot._request_key(message, "60601")
+            bot._seen_requests[key] = time.monotonic() - 1
+
+            bot._recent_acks.append(mesh.commands.ack.hex())
+            self.assertTrue(await bot.handle_message(mesh, message))
             self.assertEqual(len(mesh.commands.attempts), 2)
 
     async def test_duplicate_channel_request_is_not_answered_twice(self):
@@ -251,16 +356,11 @@ class RoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
             commands = FakeSetupCommands()
             mesh = FakeMesh(commands)
             message = weatherbot.InboundMessage(
-                "Alice: wx 60601", channel_index=1, sender_timestamp=12345
+                "Alice: wx 60601", channel_index=1
             )
             self.assertTrue(await bot.handle_message(mesh, message))
             self.assertTrue(await bot.handle_message(mesh, message))
             self.assertEqual(len(commands.channel_messages), 1)
-
-    async def test_reverse_mesh_path_helpers(self):
-        self.assertEqual(weatherbot.reverse_mesh_path("aabbccdd", 1), "ddccbbaa")
-        self.assertEqual(weatherbot.reverse_mesh_path("aabbccddeeff", 2), "eeffccddaabb")
-        self.assertEqual(weatherbot.reverse_mesh_path("", 1), "")
 
 
 class FakeSetupCommands:

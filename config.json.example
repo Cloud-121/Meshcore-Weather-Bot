@@ -13,6 +13,7 @@
   "direct_retries": 3,
   "ack_timeout_seconds": 5,
   "reconnect_seconds": 5,
+  "request_dedup_seconds": 120,
   "http_timeout_seconds": 15,
 
   "noaa_user_agent": "pymc-weatherbot/1.0 (your-email@example.com)",

@@ -27,9 +27,6 @@ from meshcore import EventType, MeshCore
 
 LOG = logging.getLogger("weatherbot")
 WX_COMMAND = re.compile(r"\s*wx\s+(\d{5})(?:-\d{4})?\s*", re.IGNORECASE)
-RX_PATH_WINDOW = 10.0
-TEXT_MSG_PAYLOAD_TYPE = 2
-DIRECT_ROUTE_TYPES = (2, 3)
 
 
 class MeshError(RuntimeError):
@@ -45,9 +42,6 @@ class InboundMessage:
     text: str
     sender_prefix: Optional[str] = None
     channel_index: Optional[int] = None
-    sender_timestamp: Optional[int] = None
-    path_len: Optional[int] = None
-    path_hash_mode: Optional[int] = None
 
     @property
     def is_channel(self) -> bool:
@@ -78,6 +72,7 @@ class BotConfig:
     direct_retries: int
     ack_timeout_seconds: float
     reconnect_seconds: float
+    request_dedup_seconds: float
     http_timeout_seconds: float
     noaa_user_agent: str
     state_file: Path
@@ -297,9 +292,7 @@ class WeatherBot:
         self._mesh_lock = asyncio.Lock()
         self._recent_acks: deque[str] = deque(maxlen=128)
         self._ack_signal = asyncio.Event()
-        self._seen_requests: deque[tuple] = deque(maxlen=256)
-        self._recent_rx_paths: deque[tuple] = deque(maxlen=64)
-        self._rx_paths: dict[str, tuple[str, int, float]] = {}
+        self._seen_requests: dict[tuple, float] = {}
         self._seen_alerts = self._load_seen_alerts()
 
     async def run_forever(self) -> None:
@@ -348,37 +341,15 @@ class WeatherBot:
         def mark_disconnected(_event: Any) -> None:
             disconnected.set()
 
-        def remember_rx_log(event: Any) -> None:
-            payload = event.payload or {}
-            if int(payload.get("payload_type") or -1) != TEXT_MSG_PAYLOAD_TYPE:
-                return
-            if int(payload.get("route_type") or -1) not in DIRECT_ROUTE_TYPES:
-                return
-            path = str(payload.get("path") or "")
-            if not path:
-                return
-            self._recent_rx_paths.append(
-                (
-                    float(payload.get("recv_time") or 0),
-                    int(payload.get("path_len") or 0),
-                    int(payload.get("path_hash_size") or 1),
-                    path,
-                )
-            )
-
         async def handle_dm(event: Any) -> None:
             payload = event.payload or {}
-            message = InboundMessage(
-                text=str(payload.get("text") or ""),
-                sender_prefix=str(payload.get("pubkey_prefix") or "").lower(),
-                sender_timestamp=int(payload["sender_timestamp"])
-                if payload.get("sender_timestamp") is not None
-                else None,
-                path_len=_path_len(payload),
-                path_hash_mode=_path_hash_mode(payload),
+            await self._safe_handle_message(
+                mesh,
+                InboundMessage(
+                    text=str(payload.get("text") or ""),
+                    sender_prefix=str(payload.get("pubkey_prefix") or "").lower(),
+                ),
             )
-            self._associate_rx_path(message)
-            await self._safe_handle_message(mesh, message)
 
         async def handle_channel(event: Any) -> None:
             payload = event.payload or {}
@@ -387,9 +358,6 @@ class WeatherBot:
                 InboundMessage(
                     text=str(payload.get("text") or ""),
                     channel_index=int(payload.get("channel_idx", -1)),
-                    sender_timestamp=int(payload["sender_timestamp"])
-                    if payload.get("sender_timestamp") is not None
-                    else None,
                 ),
             )
 
@@ -409,7 +377,6 @@ class WeatherBot:
                 attribute_filters={"channel_idx": self.config.weather_channel_index},
             ),
             mesh.subscribe(EventType.MESSAGES_WAITING, drain_waiting),
-            mesh.subscribe(EventType.RX_LOG_DATA, remember_rx_log),
         ]
         alert_task: Optional[asyncio.Task[Any]] = None
         try:
@@ -494,42 +461,26 @@ class WeatherBot:
         except Exception as exc:
             LOG.error("Could not handle mesh message: %s", exc)
 
-    def _request_key(self, message: InboundMessage) -> Optional[tuple]:
+    def _request_key(self, message: InboundMessage, zip_code: str) -> Optional[tuple]:
         if message.is_channel:
-            if message.channel_index is None or message.sender_timestamp is None:
+            if message.channel_index is None:
                 return None
-            return ("channel", message.channel_index, message.sender_timestamp, message.text)
-        if not message.sender_prefix or message.sender_timestamp is None:
+            return ("channel", message.channel_index, zip_code)
+        if not message.sender_prefix:
             return None
-        return ("dm", message.sender_prefix[:12], message.sender_timestamp, message.text)
+        return ("dm", message.sender_prefix[:12], zip_code)
 
-    def _associate_rx_path(self, message: InboundMessage) -> None:
-        """Correlate a received DM with its RF log path and cache the reverse route."""
-        if message.is_channel or not message.sender_prefix or message.path_len is None:
-            return
-        if message.path_len < 0:
-            return
-        now = time.time()
-        for recv_time, path_len, path_hash_size, path in reversed(self._recent_rx_paths):
-            if now - recv_time > RX_PATH_WINDOW:
-                continue
-            if path_len != message.path_len:
-                continue
-            reversed_path = reverse_mesh_path(path, path_hash_size)
-            if not reversed_path:
-                continue
-            hash_mode = (
-                message.path_hash_mode
-                if message.path_hash_mode is not None
-                else path_hash_size - 1
-            )
-            self._rx_paths[message.sender_prefix[:12]] = (reversed_path, hash_mode, now)
-            LOG.info(
-                "Cached newest path to %s from a received message (%d hops)",
-                message.sender_prefix[:12],
-                message.path_len,
-            )
-            return
+    def _note_seen(self, request_key: tuple) -> None:
+        self._seen_requests = {
+            key: expiry
+            for key, expiry in self._seen_requests.items()
+            if expiry > time.monotonic()
+        }
+        self._seen_requests[request_key] = time.monotonic() + self.config.request_dedup_seconds
+
+    def _is_seen(self, request_key: tuple) -> bool:
+        expiry = self._seen_requests.get(request_key)
+        return expiry is not None and expiry > time.monotonic()
 
     async def handle_message(self, mesh: Any, message: InboundMessage) -> bool:
         if message.is_channel and message.channel_index != self.config.weather_channel_index:
@@ -538,16 +489,16 @@ class WeatherBot:
         if zip_code is None:
             return False
 
-        request_key = self._request_key(message)
+        request_key = self._request_key(message, zip_code)
         if request_key is not None:
-            if request_key in self._seen_requests:
+            if self._is_seen(request_key):
                 LOG.info(
                     "Ignoring duplicate %s request for %s (retry or repeated packet)",
                     "channel" if message.is_channel else "DM",
                     zip_code,
                 )
                 return True
-            self._seen_requests.append(request_key)
+            self._note_seen(request_key)
 
         LOG.info(
             "Weather request for %s via %s",
@@ -566,6 +517,11 @@ class WeatherBot:
         if not message.sender_prefix:
             raise MeshError("a queued DM did not include its sender key prefix")
         for chunk in split_mesh_text(report):
+            LOG.debug(
+                "Sending DM chunk (%d bytes) to %s",
+                len(chunk.encode("utf-8")),
+                message.sender_prefix[:12],
+            )
             await self.send_dm_with_fallback(mesh, message.sender_prefix, chunk)
         return True
 
@@ -582,7 +538,7 @@ class WeatherBot:
     async def send_dm_with_fallback(
         self, mesh: Any, sender_prefix: str | bytes, text: str
     ) -> bool:
-        """Use the newest received path (when known), retry, then reset and flood."""
+        """Refresh the route from the newest advert path, then retry, then flood."""
         prefix = (
             sender_prefix.hex() if isinstance(sender_prefix, bytes) else sender_prefix
         ).lower()
@@ -590,7 +546,7 @@ class WeatherBot:
 
         async with self._mesh_lock:
             contact = await self._find_contact_unlocked(mesh, prefix)
-            await self._apply_rx_path_unlocked(mesh, contact, prefix)
+            await self._refresh_path_unlocked(mesh, contact, prefix)
             for attempt in range(self.config.direct_retries + 1):
                 result = await mesh.commands.send_msg(
                     contact, text, timestamp=timestamp, attempt=attempt
@@ -650,23 +606,49 @@ class WeatherBot:
             LOG.warning("Routed retries exhausted; flood-sent DM to %s", prefix)
             return True
 
-    async def _apply_rx_path_unlocked(
+    async def _refresh_path_unlocked(
         self, mesh: Any, contact: dict[str, Any], prefix: str
     ) -> None:
-        """Install the newest received path on the contact before a routed send."""
-        entry = self._rx_paths.pop(prefix[:12], None)
-        if entry is None:
+        """Refresh the contact's route from its newest advert path before sending."""
+        try:
+            result = await mesh.commands.get_advert_path(contact)
+        except Exception as exc:
+            LOG.warning("get_advert_path failed for %s: %s", prefix, exc)
             return
-        path, hash_mode, _when = entry
+        if result is None or result.type == EventType.ERROR:
+            LOG.warning(
+                "get_advert_path returned %s for %s: %s",
+                "no response" if result is None else "error",
+                prefix,
+                (result.payload or {}).get("reason") if result is not None else "",
+            )
+            return
+        payload = result.payload or {}
+        path = str(payload.get("path") or "")
+        path_len = payload.get("path_len")
+        path_hash_mode = payload.get("path_hash_mode")
+        LOG.info(
+            "Advert path for %s: len=%s mode=%s path=%s",
+            prefix,
+            path_len,
+            path_hash_mode,
+            path or "(none)",
+        )
+        if path_len is None or path_len < 0 or not path:
+            LOG.info(
+                "No routed advert path for %s; leaving the stored route unchanged",
+                prefix,
+            )
+            return
         try:
             self._require_event(
-                await mesh.commands.change_contact_path(contact, path, hash_mode),
+                await mesh.commands.change_contact_path(contact, path, path_hash_mode),
                 EventType.OK,
-                "applying the newest received path",
+                "applying the advert path",
             )
-            LOG.info("DM to %s routed via the newest received path", prefix)
+            LOG.info("Applied advert path to %s (len=%s)", prefix, path_len)
         except Exception as exc:
-            LOG.warning("Could not apply the newest received path to %s: %s", prefix, exc)
+            LOG.warning("Could not apply advert path to %s: %s", prefix, exc)
 
     async def _wait_for_ack(self, code: str, timeout: float) -> bool:
         if not code:
@@ -814,23 +796,6 @@ def normalize_zip(value: str) -> str:
     return match.group(1)
 
 
-def _path_len(payload: dict[str, Any]) -> Optional[int]:
-    value = payload.get("path_len")
-    return int(value) if value is not None else None
-
-
-def _path_hash_mode(payload: dict[str, Any]) -> Optional[int]:
-    value = payload.get("path_hash_mode")
-    return int(value) if value is not None else None
-
-
-def reverse_mesh_path(path_hex: str, hash_size: int) -> str:
-    """Reverse a received mesh path into stored outbound order."""
-    step = 2 * max(1, int(hash_size))
-    chunks = [path_hex[i : i + step] for i in range(0, len(path_hex), step)]
-    return "".join(reversed(chunks))
-
-
 def decode_channel_key(encoded: str) -> bytes:
     try:
         secret = base64.b64decode(encoded, validate=True)
@@ -922,18 +887,17 @@ def format_channel_alert(alert: dict[str, Any], zip_codes: Sequence[str]) -> str
         properties.get("ends") or properties.get("expires"),
         str(properties.get("timeZone") or ""),
     )
-    headline = clean_text(
-        str(properties.get("headline") or properties.get("description") or event)
-    )
+    description = clean_text(str(properties.get("description") or ""))
+    headline = clean_text(str(properties.get("headline") or ""))
     instruction = clean_text(str(properties.get("instruction") or ""))
     timing = f", until {ends}" if ends else ""
     zips = ",".join(sorted(set(zip_codes)))
     lines = [f"🚨 NWS ALERT — {zips}", f"⚠️ {event} ({severity}, {urgency}{timing})"]
-    details = headline
-    if instruction and instruction.casefold() not in headline.casefold():
-        details += " " + instruction
-    if details:
-        lines.append(details[:600].rstrip())
+    body = description or headline or event
+    if instruction and instruction.casefold() not in body.casefold():
+        body = f"{body} {instruction}" if body else instruction
+    if body:
+        lines.append(body[:2000].rstrip())
     return "\n".join(lines)
 
 
@@ -949,12 +913,29 @@ def _cut_utf8(text: str, byte_limit: int) -> tuple[str, str]:
 
 
 def split_mesh_text(text: str, byte_limit: int = 140) -> list[str]:
-    """Split text without breaking UTF-8, leaving room for part numbers."""
-    remaining = clean_lines(text)
+    """Split text on line/word boundaries, leaving room for part numbers."""
+    body_limit = byte_limit - 10
+    lines = clean_lines(text).split("\n")
     chunks: list[str] = []
-    while remaining:
-        chunk, remaining = _cut_utf8(remaining, byte_limit - 10)
-        chunks.append(chunk)
+    current = ""
+    for line in lines:
+        if not line:
+            continue
+        while len(line.encode("utf-8")) > body_limit:
+            piece, line = _cut_utf8(line, body_limit)
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(piece)
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate.encode("utf-8")) <= body_limit:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            current = line
+    if current:
+        chunks.append(current)
     if len(chunks) <= 1:
         return chunks
     total = len(chunks)
@@ -994,6 +975,7 @@ def load_config(path: Path) -> BotConfig:
         direct_retries=int(raw.get("direct_retries", 3)),
         ack_timeout_seconds=float(raw.get("ack_timeout_seconds", 5)),
         reconnect_seconds=float(raw.get("reconnect_seconds", 5)),
+        request_dedup_seconds=float(raw.get("request_dedup_seconds", 120)),
         http_timeout_seconds=float(raw.get("http_timeout_seconds", 15)),
         noaa_user_agent=str(raw.get("noaa_user_agent", "")).strip(),
         state_file=state,
@@ -1013,6 +995,8 @@ def load_config(path: Path) -> BotConfig:
         raise SystemExit("direct_retries must be between 0 and 10")
     if config.ack_timeout_seconds <= 0 or config.reconnect_seconds <= 0:
         raise SystemExit("ack_timeout_seconds and reconnect_seconds must be positive")
+    if config.request_dedup_seconds <= 0:
+        raise SystemExit("request_dedup_seconds must be positive")
     if config.http_timeout_seconds <= 0:
         raise SystemExit("http_timeout_seconds must be positive")
     if not config.noaa_user_agent:

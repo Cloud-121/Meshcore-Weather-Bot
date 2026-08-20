@@ -6,13 +6,13 @@ of the repeater's companion TCP ports through the maintained
 [`meshcore` Python client](https://github.com/meshcore-dev/meshcore_py); it does not
 need `openhop_core` or a separate radio.
 
-It responds to exactly `wx ZIPCODE` in a DM or in `#Weather`. A DM reply prefers the
-route the request itself came in on (tracked from the repeater's RF log), then falls
-back to the sender contact's stored route and waits for the MeshCore ACK. It makes the
-initial routed attempt plus the configured three retries. If none is acknowledged, it
-resets that stale outbound route and sends the reply once by flood. Repeated or
-retransmitted copies of the same request (same sender and original timestamp) are
-deduplicated so a retry never triggers a second reply. Channel replies and automatic
+It responds to exactly `wx ZIPCODE` in a DM or in `#Weather`. Before a DM reply the bot
+refreshes the sender's route from its newest advert path (`get_advert_path`), then uses
+that route and waits for the MeshCore ACK. It makes the initial routed attempt plus the
+configured three retries. If none is acknowledged, it resets that stale outbound route
+and sends the reply once by flood. Repeated or retransmitted copies of the same request
+from the same sender for the same ZIP are deduplicated for `request_dedup_seconds`
+(default 120) so a retry never triggers a second reply. Channel replies and automatic
 alerts are normal encrypted channel floods.
 
 Weather observations and active watches/warnings/advisories come from the US National
