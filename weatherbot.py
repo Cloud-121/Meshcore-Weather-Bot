@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional, Sequence
+from zoneinfo import ZoneInfo
 
 import httpx
 from meshcore import EventType, MeshCore
@@ -26,6 +27,9 @@ from meshcore import EventType, MeshCore
 
 LOG = logging.getLogger("weatherbot")
 WX_COMMAND = re.compile(r"\s*wx\s+(\d{5})(?:-\d{4})?\s*", re.IGNORECASE)
+RX_PATH_WINDOW = 10.0
+TEXT_MSG_PAYLOAD_TYPE = 2
+DIRECT_ROUTE_TYPES = (2, 3)
 
 
 class MeshError(RuntimeError):
@@ -41,6 +45,9 @@ class InboundMessage:
     text: str
     sender_prefix: Optional[str] = None
     channel_index: Optional[int] = None
+    sender_timestamp: Optional[int] = None
+    path_len: Optional[int] = None
+    path_hash_mode: Optional[int] = None
 
     @property
     def is_channel(self) -> bool:
@@ -172,24 +179,26 @@ class WeatherService:
 
     async def weather_report(self, zip_code: str) -> str:
         location = await self.resolve_zip(zip_code)
-        current = await self._current_conditions(location)
+        condition_lines = await self._current_conditions(location)
         alerts = await self.active_alerts(location)
-        label = f"{location.zip_code} {location.city}, {location.state}"
-        report = f"WX {label}: {current}"
+        lines = [f"☀️ {location.city}, {location.state} {location.zip_code}"]
+        lines.extend(condition_lines)
         if not alerts:
-            return report + " No active NWS alerts."
+            lines.append("✅ No active NWS alerts")
+        else:
+            for alert in alerts:
+                properties = alert.get("properties") or {}
+                event = clean_text(str(properties.get("event") or "Weather Alert"))
+                severity = clean_text(str(properties.get("severity") or "Unknown"))
+                ends = format_alert_time(
+                    properties.get("ends") or properties.get("expires"),
+                    str(properties.get("timeZone") or ""),
+                )
+                timing = f", until {ends}" if ends else ""
+                lines.append(f"⚠️ {event} ({severity}{timing})")
+        return "\n".join(lines)
 
-        summaries = []
-        for alert in alerts:
-            properties = alert.get("properties") or {}
-            event = clean_text(str(properties.get("event") or "Weather Alert"))
-            severity = clean_text(str(properties.get("severity") or "Unknown"))
-            ends = format_alert_time(properties.get("ends") or properties.get("expires"))
-            timing = f", until {ends}" if ends else ""
-            summaries.append(f"{event} ({severity}{timing})")
-        return report + " NWS alerts: " + "; ".join(summaries) + "."
-
-    async def _current_conditions(self, location: Location) -> str:
+    async def _current_conditions(self, location: Location) -> list[str]:
         if location.station_url:
             try:
                 observation = await self._get_json(
@@ -198,32 +207,46 @@ class WeatherService:
                 properties = observation.get("properties") or {}
                 temperature = quantity(properties.get("temperature"))
                 description = clean_text(str(properties.get("textDescription") or ""))
-                if temperature is not None or description:
-                    parts: list[str] = []
-                    if temperature is not None:
-                        fahrenheit = to_fahrenheit(
-                            temperature, unit_code(properties.get("temperature"))
+                lines: list[str] = []
+                temperature_line = ""
+                if temperature is not None:
+                    fahrenheit = to_fahrenheit(
+                        temperature, unit_code(properties.get("temperature"))
+                    )
+                    temperature_line = f"{round(fahrenheit)}°F"
+                if description:
+                    temperature_line = (
+                        f"{temperature_line} · {description}"
+                        if temperature_line
+                        else description
+                    )
+                if temperature_line:
+                    lines.append(f"🌡️ {temperature_line}")
+
+                humidity = quantity(properties.get("relativeHumidity"))
+                wind_parts: list[str] = []
+                wind = quantity(properties.get("windSpeed"))
+                if wind is not None:
+                    mph = to_mph(wind, unit_code(properties.get("windSpeed")))
+                    direction = quantity(properties.get("windDirection"))
+                    if mph < 1:
+                        wind_parts.append("calm")
+                    else:
+                        compass = (
+                            degrees_to_compass(direction)
+                            if direction is not None
+                            else ""
                         )
-                        parts.append(f"{round(fahrenheit)}F")
-                    if description:
-                        parts.append(description)
-                    humidity = quantity(properties.get("relativeHumidity"))
-                    if humidity is not None:
-                        parts.append(f"humidity {round(humidity)}%")
-                    wind = quantity(properties.get("windSpeed"))
-                    if wind is not None:
-                        mph = to_mph(wind, unit_code(properties.get("windSpeed")))
-                        direction = quantity(properties.get("windDirection"))
-                        if mph < 1:
-                            parts.append("wind calm")
-                        else:
-                            compass = (
-                                degrees_to_compass(direction)
-                                if direction is not None
-                                else ""
-                            )
-                            parts.append(f"wind {compass} {round(mph)} mph")
-                    return ", ".join(parts) + "."
+                        wind_parts.append(f"{compass} {round(mph)} mph")
+                stats: list[str] = []
+                if humidity is not None:
+                    stats.append(f"💧 {round(humidity)}%")
+                if wind_parts:
+                    stats.append(f"💨 {wind_parts[0]}")
+                if stats:
+                    lines.append(" · ".join(stats))
+                if lines:
+                    return lines
             except WeatherError:
                 LOG.warning(
                     "Latest observation unavailable for %s; using hourly forecast",
@@ -240,17 +263,25 @@ class WeatherService:
                     period.get("temperatureUnit") or "F"
                 ).upper() == "C":
                     temperature = float(temperature) * 9 / 5 + 32
-                parts = []
+                lines: list[str] = []
+                temperature_line = ""
                 if temperature is not None:
-                    parts.append(f"{round(float(temperature))}F")
+                    temperature_line = f"{round(float(temperature))}°F"
                 if period.get("shortForecast"):
-                    parts.append(clean_text(str(period["shortForecast"])))
-                if period.get("windSpeed"):
-                    parts.append(
-                        f"wind {period.get('windDirection') or ''} "
-                        f"{period['windSpeed']}"
+                    forecast = clean_text(str(period["shortForecast"]))
+                    temperature_line = (
+                        f"{temperature_line} · {forecast}"
+                        if temperature_line
+                        else forecast
                     )
-                return ", ".join(parts) + " (current-hour NWS forecast)."
+                if temperature_line:
+                    lines.append(f"🌡️ {temperature_line}")
+                if period.get("windSpeed"):
+                    wind_direction = period.get("windDirection") or ""
+                    lines.append(f"💨 {wind_direction} {period['windSpeed']}".strip())
+                if lines:
+                    lines.append("(current-hour NWS forecast)")
+                    return lines
         raise WeatherError("current conditions are unavailable")
 
 
@@ -266,6 +297,9 @@ class WeatherBot:
         self._mesh_lock = asyncio.Lock()
         self._recent_acks: deque[str] = deque(maxlen=128)
         self._ack_signal = asyncio.Event()
+        self._seen_requests: deque[tuple] = deque(maxlen=256)
+        self._recent_rx_paths: deque[tuple] = deque(maxlen=64)
+        self._rx_paths: dict[str, tuple[str, int, float]] = {}
         self._seen_alerts = self._load_seen_alerts()
 
     async def run_forever(self) -> None:
@@ -314,15 +348,37 @@ class WeatherBot:
         def mark_disconnected(_event: Any) -> None:
             disconnected.set()
 
+        def remember_rx_log(event: Any) -> None:
+            payload = event.payload or {}
+            if int(payload.get("payload_type") or -1) != TEXT_MSG_PAYLOAD_TYPE:
+                return
+            if int(payload.get("route_type") or -1) not in DIRECT_ROUTE_TYPES:
+                return
+            path = str(payload.get("path") or "")
+            if not path:
+                return
+            self._recent_rx_paths.append(
+                (
+                    float(payload.get("recv_time") or 0),
+                    int(payload.get("path_len") or 0),
+                    int(payload.get("path_hash_size") or 1),
+                    path,
+                )
+            )
+
         async def handle_dm(event: Any) -> None:
             payload = event.payload or {}
-            await self._safe_handle_message(
-                mesh,
-                InboundMessage(
-                    text=str(payload.get("text") or ""),
-                    sender_prefix=str(payload.get("pubkey_prefix") or "").lower(),
-                ),
+            message = InboundMessage(
+                text=str(payload.get("text") or ""),
+                sender_prefix=str(payload.get("pubkey_prefix") or "").lower(),
+                sender_timestamp=int(payload["sender_timestamp"])
+                if payload.get("sender_timestamp") is not None
+                else None,
+                path_len=_path_len(payload),
+                path_hash_mode=_path_hash_mode(payload),
             )
+            self._associate_rx_path(message)
+            await self._safe_handle_message(mesh, message)
 
         async def handle_channel(event: Any) -> None:
             payload = event.payload or {}
@@ -331,6 +387,9 @@ class WeatherBot:
                 InboundMessage(
                     text=str(payload.get("text") or ""),
                     channel_index=int(payload.get("channel_idx", -1)),
+                    sender_timestamp=int(payload["sender_timestamp"])
+                    if payload.get("sender_timestamp") is not None
+                    else None,
                 ),
             )
 
@@ -350,6 +409,7 @@ class WeatherBot:
                 attribute_filters={"channel_idx": self.config.weather_channel_index},
             ),
             mesh.subscribe(EventType.MESSAGES_WAITING, drain_waiting),
+            mesh.subscribe(EventType.RX_LOG_DATA, remember_rx_log),
         ]
         alert_task: Optional[asyncio.Task[Any]] = None
         try:
@@ -434,12 +494,60 @@ class WeatherBot:
         except Exception as exc:
             LOG.error("Could not handle mesh message: %s", exc)
 
+    def _request_key(self, message: InboundMessage) -> Optional[tuple]:
+        if message.is_channel:
+            if message.channel_index is None or message.sender_timestamp is None:
+                return None
+            return ("channel", message.channel_index, message.sender_timestamp, message.text)
+        if not message.sender_prefix or message.sender_timestamp is None:
+            return None
+        return ("dm", message.sender_prefix[:12], message.sender_timestamp, message.text)
+
+    def _associate_rx_path(self, message: InboundMessage) -> None:
+        """Correlate a received DM with its RF log path and cache the reverse route."""
+        if message.is_channel or not message.sender_prefix or message.path_len is None:
+            return
+        if message.path_len < 0:
+            return
+        now = time.time()
+        for recv_time, path_len, path_hash_size, path in reversed(self._recent_rx_paths):
+            if now - recv_time > RX_PATH_WINDOW:
+                continue
+            if path_len != message.path_len:
+                continue
+            reversed_path = reverse_mesh_path(path, path_hash_size)
+            if not reversed_path:
+                continue
+            hash_mode = (
+                message.path_hash_mode
+                if message.path_hash_mode is not None
+                else path_hash_size - 1
+            )
+            self._rx_paths[message.sender_prefix[:12]] = (reversed_path, hash_mode, now)
+            LOG.info(
+                "Cached newest path to %s from a received message (%d hops)",
+                message.sender_prefix[:12],
+                message.path_len,
+            )
+            return
+
     async def handle_message(self, mesh: Any, message: InboundMessage) -> bool:
         if message.is_channel and message.channel_index != self.config.weather_channel_index:
             return False
         zip_code = parse_wx_command(message.text, channel_message=message.is_channel)
         if zip_code is None:
             return False
+
+        request_key = self._request_key(message)
+        if request_key is not None:
+            if request_key in self._seen_requests:
+                LOG.info(
+                    "Ignoring duplicate %s request for %s (retry or repeated packet)",
+                    "channel" if message.is_channel else "DM",
+                    zip_code,
+                )
+                return True
+            self._seen_requests.append(request_key)
 
         LOG.info(
             "Weather request for %s via %s",
@@ -474,7 +582,7 @@ class WeatherBot:
     async def send_dm_with_fallback(
         self, mesh: Any, sender_prefix: str | bytes, text: str
     ) -> bool:
-        """Use the stored path, retry three times, then reset it and flood once."""
+        """Use the newest received path (when known), retry, then reset and flood."""
         prefix = (
             sender_prefix.hex() if isinstance(sender_prefix, bytes) else sender_prefix
         ).lower()
@@ -482,6 +590,7 @@ class WeatherBot:
 
         async with self._mesh_lock:
             contact = await self._find_contact_unlocked(mesh, prefix)
+            await self._apply_rx_path_unlocked(mesh, contact, prefix)
             for attempt in range(self.config.direct_retries + 1):
                 result = await mesh.commands.send_msg(
                     contact, text, timestamp=timestamp, attempt=attempt
@@ -540,6 +649,24 @@ class WeatherBot:
                 raise MeshError("companion did not switch the failed route to flood")
             LOG.warning("Routed retries exhausted; flood-sent DM to %s", prefix)
             return True
+
+    async def _apply_rx_path_unlocked(
+        self, mesh: Any, contact: dict[str, Any], prefix: str
+    ) -> None:
+        """Install the newest received path on the contact before a routed send."""
+        entry = self._rx_paths.pop(prefix[:12], None)
+        if entry is None:
+            return
+        path, hash_mode, _when = entry
+        try:
+            self._require_event(
+                await mesh.commands.change_contact_path(contact, path, hash_mode),
+                EventType.OK,
+                "applying the newest received path",
+            )
+            LOG.info("DM to %s routed via the newest received path", prefix)
+        except Exception as exc:
+            LOG.warning("Could not apply the newest received path to %s: %s", prefix, exc)
 
     async def _wait_for_ack(self, code: str, timeout: float) -> bool:
         if not code:
@@ -687,6 +814,23 @@ def normalize_zip(value: str) -> str:
     return match.group(1)
 
 
+def _path_len(payload: dict[str, Any]) -> Optional[int]:
+    value = payload.get("path_len")
+    return int(value) if value is not None else None
+
+
+def _path_hash_mode(payload: dict[str, Any]) -> Optional[int]:
+    value = payload.get("path_hash_mode")
+    return int(value) if value is not None else None
+
+
+def reverse_mesh_path(path_hex: str, hash_size: int) -> str:
+    """Reverse a received mesh path into stored outbound order."""
+    step = 2 * max(1, int(hash_size))
+    chunks = [path_hex[i : i + step] for i in range(0, len(path_hex), step)]
+    return "".join(reversed(chunks))
+
+
 def decode_channel_key(encoded: str) -> bytes:
     try:
         secret = base64.b64decode(encoded, validate=True)
@@ -699,6 +843,11 @@ def decode_channel_key(encoded: str) -> bytes:
 
 def clean_text(value: str) -> str:
     return " ".join(value.replace("\x00", " ").split())
+
+
+def clean_lines(text: str) -> str:
+    lines = [clean_text(line) for line in text.replace("\x00", " ").splitlines()]
+    return "\n".join(line for line in lines if line)
 
 
 def quantity(value: Any) -> Optional[float]:
@@ -733,11 +882,16 @@ def degrees_to_compass(degrees: float) -> str:
     return points[int((degrees + 22.5) // 45) % 8]
 
 
-def format_alert_time(value: Any) -> str:
+def format_alert_time(value: Any, timezone: Optional[str] = None) -> str:
     if not value:
         return ""
     try:
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if timezone and parsed.tzinfo is not None:
+            try:
+                parsed = parsed.astimezone(ZoneInfo(timezone))
+            except (KeyError, ValueError, TypeError):
+                pass
         return parsed.strftime("%b %d %I:%M %p %Z").replace(" 0", " ").strip()
     except ValueError:
         return clean_text(str(value))[:40]
@@ -764,20 +918,23 @@ def format_channel_alert(alert: dict[str, Any], zip_codes: Sequence[str]) -> str
     event = clean_text(str(properties.get("event") or "Weather Alert"))
     severity = clean_text(str(properties.get("severity") or "Unknown"))
     urgency = clean_text(str(properties.get("urgency") or "Unknown"))
-    ends = format_alert_time(properties.get("ends") or properties.get("expires"))
+    ends = format_alert_time(
+        properties.get("ends") or properties.get("expires"),
+        str(properties.get("timeZone") or ""),
+    )
     headline = clean_text(
         str(properties.get("headline") or properties.get("description") or event)
     )
     instruction = clean_text(str(properties.get("instruction") or ""))
+    timing = f", until {ends}" if ends else ""
+    zips = ",".join(sorted(set(zip_codes)))
+    lines = [f"🚨 NWS ALERT — {zips}", f"⚠️ {event} ({severity}, {urgency}{timing})"]
     details = headline
     if instruction and instruction.casefold() not in headline.casefold():
         details += " " + instruction
-    timing = f", until {ends}" if ends else ""
-    zips = ",".join(sorted(set(zip_codes)))
-    return (
-        f"NWS ALERT [{zips}]: {event} ({severity}, {urgency}{timing}). "
-        f"{details[:600].rstrip()}"
-    )
+    if details:
+        lines.append(details[:600].rstrip())
+    return "\n".join(lines)
 
 
 def _cut_utf8(text: str, byte_limit: int) -> tuple[str, str]:
@@ -793,7 +950,7 @@ def _cut_utf8(text: str, byte_limit: int) -> tuple[str, str]:
 
 def split_mesh_text(text: str, byte_limit: int = 140) -> list[str]:
     """Split text without breaking UTF-8, leaving room for part numbers."""
-    remaining = clean_text(text)
+    remaining = clean_lines(text)
     chunks: list[str] = []
     while remaining:
         chunk, remaining = _cut_utf8(remaining, byte_limit - 10)

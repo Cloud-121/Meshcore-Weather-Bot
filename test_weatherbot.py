@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -87,6 +88,7 @@ class FakeWeatherService(weatherbot.WeatherService):
                         "properties": {
                             "event": "Heat Advisory",
                             "severity": "Moderate",
+                            "timeZone": "America/Chicago",
                             "sent": "2026-08-20T10:00:00-05:00",
                             "ends": "2026-08-20T20:00:00-05:00",
                         },
@@ -101,12 +103,24 @@ class WeatherFormattingTests(unittest.IsolatedAsyncioTestCase):
         service = FakeWeatherService()
         report = await service.weather_report("60601")
         await service.close()
-        self.assertIn("WX 60601 Chicago, IL", report)
-        self.assertIn("68F", report)
-        self.assertIn("humidity 50%", report)
-        self.assertIn("wind SW 10 mph", report)
-        self.assertIn("Heat Advisory", report)
+        self.assertIn("☀️ Chicago, IL 60601", report)
+        self.assertIn("68°F", report)
+        self.assertIn("💧 50%", report)
+        self.assertIn("💨 SW 10 mph", report)
+        self.assertIn("⚠️ Heat Advisory", report)
         self.assertEqual(service.alert_params, {"point": "41.8858,-87.6181"})
+
+    async def test_report_lines_fit_mesh_limit(self):
+        service = FakeWeatherService()
+        report = await service.weather_report("60601")
+        await service.close()
+        chunks = weatherbot.split_mesh_text(report, 140)
+        self.assertTrue(all(len(chunk.encode("utf-8")) <= 140 for chunk in chunks))
+
+    async def test_split_mesh_text_preserves_line_breaks(self):
+        chunks = weatherbot.split_mesh_text("☀️ Line one\n💧 Line two", 140)
+        self.assertGreaterEqual(len(chunks), 1)
+        self.assertIn("\n", chunks[0])
 
     async def test_utf8_chunks_fit_mesh_limit(self):
         chunks = weatherbot.split_mesh_text("storm warning " * 100 + "☂", 140)
@@ -129,6 +143,7 @@ class FakeRoutingCommands:
         self.ack = ack
         self.attempts = []
         self.reset_contacts = []
+        self.path_changes = []
         self.flood = False
 
     async def send_msg(self, contact, text, timestamp, attempt):
@@ -141,6 +156,10 @@ class FakeRoutingCommands:
                 "suggested_timeout": 1,
             },
         )
+
+    async def change_contact_path(self, contact, path, path_hash_mode=None):
+        self.path_changes.append((contact, path, path_hash_mode))
+        return FakeEvent(EventType.OK)
 
     async def reset_path(self, contact):
         self.reset_contacts.append(contact)
@@ -185,6 +204,63 @@ class RoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(len(mesh.commands.attempts), 1)
         self.assertEqual(mesh.commands.reset_contacts, [])
+
+    async def test_newest_received_path_is_reversed_and_applied(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot, mesh, contact = self.make_bot_and_mesh(directory)
+            bot._recent_rx_paths.append((time.time(), 2, 1, "aabbccdd"))
+            dm = weatherbot.InboundMessage(
+                "wx 60601",
+                sender_prefix="313233343536",
+                path_len=2,
+                path_hash_mode=0,
+            )
+            bot._associate_rx_path(dm)
+            self.assertEqual(bot._rx_paths["313233343536"][:2], ("ddccbbaa", 0))
+            self.assertTrue(
+                await bot.send_dm_with_fallback(mesh, "313233343536", "weather")
+            )
+        self.assertEqual(mesh.commands.path_changes, [(contact, "ddccbbaa", 0)])
+
+    async def test_duplicate_dm_is_not_answered_twice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot, mesh, _contact = self.make_bot_and_mesh(directory)
+            message = weatherbot.InboundMessage(
+                "wx 60601", sender_prefix="313233343536", sender_timestamp=12345
+            )
+            bot._recent_acks.append(mesh.commands.ack.hex())
+            self.assertTrue(await bot.handle_message(mesh, message))
+            self.assertEqual(len(mesh.commands.attempts), 1)
+
+            bot._recent_acks.append(mesh.commands.ack.hex())
+            self.assertTrue(await bot.handle_message(mesh, message))
+            self.assertEqual(len(mesh.commands.attempts), 1)
+
+            newer = weatherbot.InboundMessage(
+                "wx 60601", sender_prefix="313233343536", sender_timestamp=12346
+            )
+            bot._recent_acks.append(mesh.commands.ack.hex())
+            self.assertTrue(await bot.handle_message(mesh, newer))
+            self.assertEqual(len(mesh.commands.attempts), 2)
+
+    async def test_duplicate_channel_request_is_not_answered_twice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot = weatherbot.WeatherBot(
+                make_config(Path(directory) / "state.json"), weather=FakeBriefWeather()
+            )
+            commands = FakeSetupCommands()
+            mesh = FakeMesh(commands)
+            message = weatherbot.InboundMessage(
+                "Alice: wx 60601", channel_index=1, sender_timestamp=12345
+            )
+            self.assertTrue(await bot.handle_message(mesh, message))
+            self.assertTrue(await bot.handle_message(mesh, message))
+            self.assertEqual(len(commands.channel_messages), 1)
+
+    async def test_reverse_mesh_path_helpers(self):
+        self.assertEqual(weatherbot.reverse_mesh_path("aabbccdd", 1), "ddccbbaa")
+        self.assertEqual(weatherbot.reverse_mesh_path("aabbccddeeff", 2), "eeffccddaabb")
+        self.assertEqual(weatherbot.reverse_mesh_path("", 1), "")
 
 
 class FakeSetupCommands:
@@ -272,6 +348,7 @@ class FakeAlertWeather:
                     "event": "Tornado Warning",
                     "severity": "Extreme",
                     "urgency": "Immediate",
+                    "timeZone": "America/New_York",
                     "headline": "Take shelter now.",
                     "sent": "2026-08-20T12:00:00Z",
                     "expires": "2026-08-20T13:00:00Z",
