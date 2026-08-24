@@ -97,6 +97,7 @@ class BotConfig:
     test_channel_name: str
     alert_zip_codes: list[str]
     alert_poll_seconds: int
+    companion_poll_seconds: float
     direct_retries: int
     ack_timeout_seconds: float
     reconnect_seconds: float
@@ -408,7 +409,10 @@ class WeatherBot:
                 self._recent_acks.append(code.lower())
                 self._ack_signal.set()
 
-        def mark_disconnected(_event: Any) -> None:
+        def mark_disconnected(event: Any) -> None:
+            payload = event.payload or {}
+            reason = payload.get("reason") if isinstance(payload, dict) else payload
+            LOG.warning("Companion connection disconnected: %s", reason or "unknown")
             disconnected.set()
 
         async def handle_dm(event: Any) -> None:
@@ -465,18 +469,25 @@ class WeatherBot:
                 )
             )
         alert_task: Optional[asyncio.Task[Any]] = None
+        message_poll_task: Optional[asyncio.Task[Any]] = None
         try:
             await self._prepare_mesh(mesh)
             await self._drain_messages(mesh)
+            message_poll_task = asyncio.create_task(
+                self._message_poll_loop(mesh, disconnected),
+                name="weatherbot-message-poll",
+            )
             alert_task = asyncio.create_task(
                 self._alert_loop(mesh), name="weatherbot-alerts"
             )
             await disconnected.wait()
         finally:
-            if alert_task is not None:
-                alert_task.cancel()
+            for task in (message_poll_task, alert_task):
+                if task is None:
+                    continue
+                task.cancel()
                 try:
-                    await alert_task
+                    await task
                 except asyncio.CancelledError:
                     pass
             for subscription in subscriptions:
@@ -554,8 +565,47 @@ class WeatherBot:
                 ):
                     raise MeshError(f"unexpected queued-message response: {result.type}")
 
+    async def _message_poll_loop(self, mesh: Any, disconnected: asyncio.Event) -> None:
+        """Keep the companion active and fetch messages when wake events are missed."""
+        while not disconnected.is_set():
+            try:
+                await asyncio.wait_for(
+                    disconnected.wait(), timeout=self.config.companion_poll_seconds
+                )
+                return
+            except asyncio.TimeoutError:
+                pass
+            try:
+                await self._drain_messages(mesh)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                LOG.warning("Companion message poll failed: %s", exc)
+
     async def _safe_handle_message(self, mesh: Any, message: InboundMessage) -> None:
         try:
+            command = command_text(message.text, message.is_channel)
+            LOG.debug(
+                "Received %s message%s (%d characters; command=%s)",
+                "channel" if message.is_channel else "DM",
+                (
+                    f" on channel {message.channel_index}"
+                    if message.is_channel
+                    else f" from {message.sender_prefix[:12]}"
+                    if message.sender_prefix
+                    else ""
+                ),
+                len(message.text),
+                "yes"
+                if (
+                    PING_COMMAND.fullmatch(command)
+                    or WX_HELP_COMMAND.fullmatch(command)
+                    or WX_VERSION_COMMAND.fullmatch(command)
+                    or WX_REPORT_COMMAND.fullmatch(command)
+                    or WX_COMMAND.fullmatch(command)
+                )
+                else "no",
+            )
             await self.handle_message(mesh, message)
         except Exception as exc:
             LOG.error("Could not handle mesh message: %s", exc)
@@ -1339,6 +1389,7 @@ def load_config(path: Path) -> BotConfig:
         test_channel_name=str(raw.get("test_channel_name", "test")).lstrip("#"),
         alert_zip_codes=list(dict.fromkeys(zip_codes)),
         alert_poll_seconds=int(raw.get("alert_poll_seconds", 60)),
+        companion_poll_seconds=float(raw.get("companion_poll_seconds", 30)),
         direct_retries=int(raw.get("direct_retries", 3)),
         ack_timeout_seconds=float(raw.get("ack_timeout_seconds", 5)),
         reconnect_seconds=float(raw.get("reconnect_seconds", 5)),
@@ -1364,6 +1415,8 @@ def load_config(path: Path) -> BotConfig:
         raise SystemExit("bot_name must be 1-31 UTF-8 bytes")
     if config.alert_poll_seconds < 30:
         raise SystemExit("alert_poll_seconds must be at least 30")
+    if config.companion_poll_seconds <= 0:
+        raise SystemExit("companion_poll_seconds must be positive")
     if not 0 <= config.direct_retries <= 10:
         raise SystemExit("direct_retries must be between 0 and 10")
     if config.ack_timeout_seconds <= 0 or config.reconnect_seconds <= 0:

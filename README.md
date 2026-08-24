@@ -83,6 +83,10 @@ are combined across matching ZIPs, sent once to `#Weather`, and recorded in
 that are already active. DM report subscriptions and per-user delivery history live in
 the same state file; a new subscription also receives any currently active alert.
 Polling cannot be configured below 30 seconds, matching NWS rate-limit guidance.
+Use only real five-digit ZIP codes in this list; use `[]` to disable automatic channel
+alerts. `companion_poll_seconds` (default 30) periodically fetches queued mesh
+messages and keeps the companion TCP connection active when it would otherwise idle
+out. Set `log_level` to `DEBUG` to see inbound-message metadata and command detection.
 
 Test the Internet-side lookup without a repeater:
 

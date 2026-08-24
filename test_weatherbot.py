@@ -30,6 +30,7 @@ def make_config(state_file, **changes):
         test_channel_name="test",
         alert_zip_codes=[],
         alert_poll_seconds=60,
+        companion_poll_seconds=30,
         direct_retries=3,
         ack_timeout_seconds=0.001,
         reconnect_seconds=1,
@@ -206,6 +207,34 @@ class WeatherFormattingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(weatherbot.parse_wx_command("Alice: wx 60601"))
         self.assertIsNone(weatherbot.parse_wx_command("wx 60601 please"))
+
+
+class ConfigurationTests(unittest.TestCase):
+    def test_companion_poll_defaults_and_must_be_positive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "noaa_user_agent": "weatherbot-tests (tests@example.com)",
+                        "alert_zip_codes": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(weatherbot.load_config(path).companion_poll_seconds, 30)
+
+            path.write_text(
+                json.dumps(
+                    {
+                        "noaa_user_agent": "weatherbot-tests (tests@example.com)",
+                        "companion_poll_seconds": 0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(SystemExit, "companion_poll_seconds"):
+                weatherbot.load_config(path)
 
 
 class FakeRoutingCommands:
@@ -446,6 +475,43 @@ class FakeBriefWeather:
 
 
 class MeshAdapterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_message_poll_drains_at_configured_interval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot = weatherbot.WeatherBot(
+                make_config(
+                    Path(directory) / "state.json", companion_poll_seconds=0.001
+                ),
+                weather=FakeBriefWeather(),
+            )
+            disconnected = asyncio.Event()
+            calls = 0
+
+            async def drain(_mesh):
+                nonlocal calls
+                calls += 1
+                disconnected.set()
+
+            bot._drain_messages = drain
+            await bot._message_poll_loop(object(), disconnected)
+
+        self.assertEqual(calls, 1)
+
+    async def test_safe_handler_logs_inbound_metadata_without_message_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot = weatherbot.WeatherBot(
+                make_config(Path(directory) / "state.json"), weather=FakeBriefWeather()
+            )
+            with self.assertLogs("weatherbot", "DEBUG") as captured:
+                await bot._safe_handle_message(
+                    FakeMesh(FakeSetupCommands()),
+                    weatherbot.InboundMessage("not a command", channel_index=1),
+                )
+
+        output = "\n".join(captured.output)
+        self.assertIn("Received channel message on channel 1", output)
+        self.assertIn("command=no", output)
+        self.assertNotIn("not a command", output)
+
     async def test_setup_uses_meshcore_commands_and_exact_16_byte_key(self):
         with tempfile.TemporaryDirectory() as directory:
             key = bytes(range(16))
