@@ -84,8 +84,14 @@ Please run wx report ZIPCODE or wx report stop in a DM.
 ```text
 🏓 Pong
 Received: <UTC ISO-8601 time>
-Path: <route, hop count, or unavailable>
+Path: <raw route hashes, hop count, or unavailable>
+Approx. direct distance: <miles> mi
 ```
+
+The distance line is present only when the bot and a DM sender have advertised GPS
+coordinates. It is straight-line endpoint distance, not the distance through relays.
+For `#test`, raw hashes are uppercase and dash-separated (for example, `AF-2B-8A` or
+`AF2B-8A10`); unmatched packets and DMs fall back to hop count.
 
 ## NWS alert notification
 
@@ -151,7 +157,7 @@ The weather JSON uses short keys to keep mesh messages small:
 {"type":"version","git_commit":"<Git commit>"}
 {"type":"report","status":"enabled","zip_code":"<ZIPCODE>","stop_command":"wx report stop"}
 {"type":"report","status":"stopped","zip_codes":["<ZIPCODE>"]}
-{"type":"pong","received_at":"<UTC ISO-8601 time>","path":"<route>"}
+{"type":"pong","received_at":"<UTC ISO-8601 time>","path":"<route>","approx_direct_miles":12.3}
 {"type":"error","command":"wx","zip_code":"<ZIPCODE>","error":"<reason>"}
 {"type":"error","command":"wx report","error":"run this command in a DM"}
 ```

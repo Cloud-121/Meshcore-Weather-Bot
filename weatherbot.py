@@ -10,13 +10,14 @@ import binascii
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import subprocess
 import sys
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -34,6 +35,8 @@ WX_REPORT_COMMAND = re.compile(
     r"\s*wx\s+report\s+(stop|(\d{5})(?:-\d{4})?)(?:\s+(json))?\s*", re.IGNORECASE
 )
 PING_COMMAND = re.compile(r"\s*ping(?:\s+(json))?\s*", re.IGNORECASE)
+RAW_PATH_CACHE_SECONDS = 10.0
+RAW_PATH_CACHE_LIMIT = 128
 HELP_TEXT = (
     "Gulf Coast Mesh Bot, Designed by ScarlettOSA\n"
     "wx ZIPCODE: weather report\n"
@@ -66,6 +69,8 @@ class InboundMessage:
     path: Optional[str] = None
     path_len: Optional[int] = None
     path_hash_mode: Optional[int] = None
+    sender_timestamp: Optional[int] = None
+    approx_direct_miles: Optional[float] = None
     received_at: Optional[datetime] = None
 
     @property
@@ -96,7 +101,6 @@ class BotConfig:
     test_channel_name: str
     alert_zip_codes: list[str]
     alert_poll_seconds: int
-    companion_poll_seconds: float
     direct_retries: int
     ack_timeout_seconds: float
     reconnect_seconds: float
@@ -399,6 +403,10 @@ class WeatherBot:
         )
         self._advertised = False
         self._contacts: dict[str, dict[str, Any]] = {}
+        self._bot_coordinates: Optional[tuple[float, float]] = None
+        self._raw_channel_paths: deque[tuple[float, int, str, str, int]] = deque(
+            maxlen=RAW_PATH_CACHE_LIMIT
+        )
         self._mesh_lock = asyncio.Lock()
         self._recent_acks: deque[str] = deque(maxlen=128)
         self._ack_signal = asyncio.Event()
@@ -445,6 +453,7 @@ class WeatherBot:
 
     async def _serve_connection(self, mesh: Any) -> None:
         disconnected = asyncio.Event()
+        inbound_messages: asyncio.Queue[InboundMessage] = asyncio.Queue()
 
         def remember_ack(event: Any) -> None:
             code = str((event.payload or {}).get("code") or event.attributes.get("code") or "")
@@ -460,31 +469,43 @@ class WeatherBot:
 
         async def handle_dm(event: Any) -> None:
             payload = event.payload or {}
-            await self._safe_handle_message(
-                mesh,
-                InboundMessage(
+            message = InboundMessage(
                     text=str(payload.get("text") or ""),
                     sender_prefix=str(payload.get("pubkey_prefix") or "").lower(),
                     path=str(payload.get("path") or "") or None,
                     path_len=integer_or_none(payload.get("path_len")),
                     path_hash_mode=integer_or_none(payload.get("path_hash_mode")),
+                    sender_timestamp=integer_or_none(payload.get("sender_timestamp")),
                     received_at=datetime.now(tz=ZoneInfo("UTC")),
-                ),
+                )
+            await inbound_messages.put(
+                replace(message, approx_direct_miles=self._direct_distance_miles(message))
             )
 
         async def handle_channel(event: Any) -> None:
             payload = event.payload or {}
-            await self._safe_handle_message(
-                mesh,
-                InboundMessage(
+            message = InboundMessage(
                     text=str(payload.get("text") or ""),
                     channel_index=int(payload.get("channel_idx", -1)),
                     path=str(payload.get("path") or "") or None,
                     path_len=integer_or_none(payload.get("path_len")),
                     path_hash_mode=integer_or_none(payload.get("path_hash_mode")),
+                    sender_timestamp=integer_or_none(payload.get("sender_timestamp")),
                     received_at=datetime.now(tz=ZoneInfo("UTC")),
-                ),
-            )
+                )
+            await inbound_messages.put(self._attach_raw_channel_path(message))
+
+        async def remember_raw_channel_path(event: Any) -> None:
+            payload = event.payload or {}
+            if str(payload.get("chan_name") or "").lstrip("#").casefold() != self.config.test_channel_name.casefold():
+                return
+            path = str(payload.get("path") or "")
+            timestamp = integer_or_none(payload.get("sender_timestamp"))
+            text = str(payload.get("message") or "")
+            hash_size = integer_or_none(payload.get("path_hash_size"))
+            if not path or timestamp is None or not text or hash_size not in (1, 2, 3):
+                return
+            self._remember_raw_channel_path(timestamp, text, path, hash_size - 1)
 
         async def drain_waiting(_event: Any) -> None:
             try:
@@ -496,6 +517,7 @@ class WeatherBot:
             mesh.subscribe(EventType.ACK, remember_ack),
             mesh.subscribe(EventType.DISCONNECTED, mark_disconnected),
             mesh.subscribe(EventType.CONTACT_MSG_RECV, handle_dm),
+            mesh.subscribe(EventType.RX_LOG_DATA, remember_raw_channel_path),
             mesh.subscribe(
                 EventType.CHANNEL_MSG_RECV,
                 handle_channel,
@@ -512,20 +534,20 @@ class WeatherBot:
                 )
             )
         alert_task: Optional[asyncio.Task[Any]] = None
-        message_poll_task: Optional[asyncio.Task[Any]] = None
+        message_worker_task: Optional[asyncio.Task[Any]] = None
         try:
             await self._prepare_mesh(mesh)
             await self._drain_messages(mesh)
-            message_poll_task = asyncio.create_task(
-                self._message_poll_loop(mesh, disconnected),
-                name="weatherbot-message-poll",
+            message_worker_task = asyncio.create_task(
+                self._message_worker(mesh, inbound_messages),
+                name="weatherbot-message-worker",
             )
             alert_task = asyncio.create_task(
                 self._alert_loop(mesh), name="weatherbot-alerts"
             )
             await disconnected.wait()
         finally:
-            for task in (message_poll_task, alert_task):
+            for task in (message_worker_task, alert_task):
                 if task is None:
                     continue
                 task.cancel()
@@ -538,6 +560,9 @@ class WeatherBot:
 
     async def _prepare_mesh(self, mesh: Any) -> None:
         async with self._mesh_lock:
+            self._bot_coordinates = coordinates_or_none(
+                getattr(mesh, "self_info", {})
+            )
             self._require_event(
                 await mesh.commands.set_name(self.config.bot_name),
                 EventType.OK,
@@ -591,6 +616,51 @@ class WeatherBot:
                 self._advertised = True
         LOG.info("Weather bot is ready on #%s", actual)
 
+    def _remember_raw_channel_path(
+        self, sender_timestamp: int, text: str, path: str, path_hash_mode: int
+    ) -> None:
+        now = time.monotonic()
+        self._raw_channel_paths = deque(
+            (item for item in self._raw_channel_paths if item[0] >= now - RAW_PATH_CACHE_SECONDS),
+            maxlen=RAW_PATH_CACHE_LIMIT,
+        )
+        self._raw_channel_paths.append(
+            (now, sender_timestamp, command_text(text, True), path, path_hash_mode)
+        )
+
+    def _attach_raw_channel_path(self, message: InboundMessage) -> InboundMessage:
+        """Attach only an exact #test raw-log match; DMs are never guessed."""
+        if (
+            message.channel_index != self.config.test_channel_index
+            or message.sender_timestamp is None
+        ):
+            return message
+        now = time.monotonic()
+        wanted_text = command_text(message.text, True)
+        retained: deque[tuple[float, int, str, str, int]] = deque(
+            maxlen=RAW_PATH_CACHE_LIMIT
+        )
+        match: Optional[tuple[str, int]] = None
+        while self._raw_channel_paths:
+            received, timestamp, text, path, mode = self._raw_channel_paths.popleft()
+            if received < now - RAW_PATH_CACHE_SECONDS:
+                continue
+            if match is None and timestamp == message.sender_timestamp and text == wanted_text:
+                match = (path, mode)
+                continue
+            retained.append((received, timestamp, text, path, mode))
+        self._raw_channel_paths = retained
+        return replace(message, path=match[0], path_hash_mode=match[1]) if match else message
+
+    def _direct_distance_miles(self, message: InboundMessage) -> Optional[float]:
+        if not message.sender_prefix or self._bot_coordinates is None:
+            return None
+        contact = self._contacts.get(message.sender_prefix[:12].lower())
+        sender_coordinates = coordinates_or_none(contact or {})
+        if sender_coordinates is None:
+            return None
+        return haversine_miles(self._bot_coordinates, sender_coordinates)
+
     async def _drain_messages(self, mesh: Any) -> None:
         async with self._mesh_lock:
             while mesh.connection_manager.is_connected:
@@ -608,22 +678,16 @@ class WeatherBot:
                 ):
                     raise MeshError(f"unexpected queued-message response: {result.type}")
 
-    async def _message_poll_loop(self, mesh: Any, disconnected: asyncio.Event) -> None:
-        """Keep the companion active and fetch messages when wake events are missed."""
-        while not disconnected.is_set():
+    async def _message_worker(
+        self, mesh: Any, inbound_messages: asyncio.Queue[InboundMessage]
+    ) -> None:
+        """Handle incoming messages in the order MeshCore delivered them."""
+        while True:
+            message = await inbound_messages.get()
             try:
-                await asyncio.wait_for(
-                    disconnected.wait(), timeout=self.config.companion_poll_seconds
-                )
-                return
-            except asyncio.TimeoutError:
-                pass
-            try:
-                await self._drain_messages(mesh)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                LOG.warning("Companion message poll failed: %s", exc)
+                await self._safe_handle_message(mesh, message)
+            finally:
+                inbound_messages.task_done()
 
     async def _safe_handle_message(self, mesh: Any, message: InboundMessage) -> None:
         try:
@@ -653,14 +717,18 @@ class WeatherBot:
         except Exception as exc:
             LOG.error("Could not handle mesh message: %s", exc)
 
-    def _request_key(self, message: InboundMessage, zip_code: str) -> Optional[tuple]:
+    def _request_key(self, message: InboundMessage) -> Optional[tuple]:
+        """Return a stable identity for one received packet, if MeshCore supplied it."""
+        if message.sender_timestamp is None:
+            return None
+        text_digest = hashlib.sha256(message.text.encode("utf-8")).hexdigest()
         if message.is_channel:
             if message.channel_index is None:
                 return None
-            return ("channel", message.channel_index, zip_code)
+            return ("channel", message.channel_index, message.sender_timestamp, text_digest)
         if not message.sender_prefix:
             return None
-        return ("dm", message.sender_prefix[:12], zip_code)
+        return ("dm", message.sender_prefix[:12], message.sender_timestamp, text_digest)
 
     def _note_seen(self, request_key: tuple) -> None:
         self._seen_requests = {
@@ -767,7 +835,7 @@ class WeatherBot:
             return False
         zip_code, wants_json = request
 
-        request_key = self._request_key(message, zip_code)
+        request_key = self._request_key(message)
         if request_key is not None:
             if self._is_seen(request_key):
                 LOG.info(
@@ -1173,15 +1241,45 @@ def integer_or_none(value: Any) -> Optional[int]:
         return None
 
 
+def coordinates_or_none(data: dict[str, Any]) -> Optional[tuple[float, float]]:
+    """Return usable advertised coordinates, treating the default as unavailable."""
+    try:
+        latitude = float(data.get("adv_lat"))
+        longitude = float(data.get("adv_lon"))
+    except (TypeError, ValueError):
+        return None
+    if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+        return None
+    if latitude == 0 and longitude == 0:
+        return None
+    return latitude, longitude
+
+
+def haversine_miles(
+    first: tuple[float, float], second: tuple[float, float]
+) -> float:
+    first_latitude, first_longitude = map(math.radians, first)
+    second_latitude, second_longitude = map(math.radians, second)
+    latitude_delta = second_latitude - first_latitude
+    longitude_delta = second_longitude - first_longitude
+    value = (
+        math.sin(latitude_delta / 2) ** 2
+        + math.cos(first_latitude)
+        * math.cos(second_latitude)
+        * math.sin(longitude_delta / 2) ** 2
+    )
+    return 3958.7613 * 2 * math.asin(math.sqrt(value))
+
+
 def route_description(message: InboundMessage) -> str:
     if message.path:
         hash_size = (message.path_hash_mode or 0) + 1
         if hash_size > 0 and len(message.path) % (hash_size * 2) == 0:
-            return " > ".join(
-                message.path[index : index + hash_size * 2]
+            return "-".join(
+                message.path[index : index + hash_size * 2].upper()
                 for index in range(0, len(message.path), hash_size * 2)
             )
-        return message.path
+        return message.path.upper()
     if message.path_len is not None and message.path_len >= 0 and message.path_len != 255:
         return f"{message.path_len} hops"
     return "unavailable"
@@ -1189,16 +1287,22 @@ def route_description(message: InboundMessage) -> str:
 
 def ping_response_data(message: InboundMessage) -> dict[str, Any]:
     received = message.received_at or datetime.now(tz=ZoneInfo("UTC"))
-    return {
+    data: dict[str, Any] = {
         "type": "pong",
         "received_at": received.astimezone(ZoneInfo("UTC")).isoformat(),
         "path": route_description(message),
     }
+    if message.approx_direct_miles is not None:
+        data["approx_direct_miles"] = round(message.approx_direct_miles, 1)
+    return data
 
 
 def format_ping_response(message: InboundMessage) -> str:
     data = ping_response_data(message)
-    return f"🏓 Pong\nReceived: {data['received_at']}\nPath: {data['path']}"
+    response = f"🏓 Pong\nReceived: {data['received_at']}\nPath: {data['path']}"
+    if "approx_direct_miles" in data:
+        response += f"\nApprox. direct distance: {data['approx_direct_miles']:.1f} mi"
+    return response
 
 
 def help_response_data() -> dict[str, Any]:
@@ -1432,7 +1536,6 @@ def load_config(path: Path) -> BotConfig:
         test_channel_name=str(raw.get("test_channel_name", "test")).lstrip("#"),
         alert_zip_codes=list(dict.fromkeys(zip_codes)),
         alert_poll_seconds=int(raw.get("alert_poll_seconds", 60)),
-        companion_poll_seconds=float(raw.get("companion_poll_seconds", 30)),
         direct_retries=int(raw.get("direct_retries", 3)),
         ack_timeout_seconds=float(raw.get("ack_timeout_seconds", 5)),
         reconnect_seconds=float(raw.get("reconnect_seconds", 5)),
@@ -1458,8 +1561,6 @@ def load_config(path: Path) -> BotConfig:
         raise SystemExit("bot_name must be 1-31 UTF-8 bytes")
     if config.alert_poll_seconds < 30:
         raise SystemExit("alert_poll_seconds must be at least 30")
-    if config.companion_poll_seconds <= 0:
-        raise SystemExit("companion_poll_seconds must be positive")
     if not 0 <= config.direct_retries <= 10:
         raise SystemExit("direct_retries must be between 0 and 10")
     if config.ack_timeout_seconds <= 0 or config.reconnect_seconds <= 0:

@@ -30,7 +30,6 @@ def make_config(state_file, **changes):
         test_channel_name="test",
         alert_zip_codes=[],
         alert_poll_seconds=60,
-        companion_poll_seconds=30,
         direct_retries=3,
         ack_timeout_seconds=0.001,
         reconnect_seconds=1,
@@ -227,7 +226,7 @@ class WeatherFormattingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ConfigurationTests(unittest.TestCase):
-    def test_companion_poll_defaults_and_must_be_positive(self):
+    def test_legacy_companion_poll_setting_is_ignored(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
             path.write_text(
@@ -235,23 +234,14 @@ class ConfigurationTests(unittest.TestCase):
                     {
                         "noaa_user_agent": "weatherbot-tests (tests@example.com)",
                         "alert_zip_codes": [],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            self.assertEqual(weatherbot.load_config(path).companion_poll_seconds, 30)
-
-            path.write_text(
-                json.dumps(
-                    {
-                        "noaa_user_agent": "weatherbot-tests (tests@example.com)",
                         "companion_poll_seconds": 0,
                     }
                 ),
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(SystemExit, "companion_poll_seconds"):
-                weatherbot.load_config(path)
+            self.assertFalse(
+                hasattr(weatherbot.load_config(path), "companion_poll_seconds")
+            )
 
 
 class FakeRoutingCommands:
@@ -365,7 +355,7 @@ class RoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             bot, mesh, _contact = self.make_bot_and_mesh(directory)
             message = weatherbot.InboundMessage(
-                "wx 60601", sender_prefix="313233343536"
+                "wx 60601", sender_prefix="313233343536", sender_timestamp=100
             )
             bot._recent_acks.append(mesh.commands.ack.hex())
             self.assertTrue(await bot.handle_message(mesh, message))
@@ -375,11 +365,11 @@ class RoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await bot.handle_message(mesh, message))
             self.assertEqual(len(mesh.commands.attempts), 1)
 
-            other = weatherbot.InboundMessage(
-                "wx 60602", sender_prefix="313233343536"
+            resent = weatherbot.InboundMessage(
+                "wx 60601", sender_prefix="313233343536", sender_timestamp=101
             )
             bot._recent_acks.append(mesh.commands.ack.hex())
-            self.assertTrue(await bot.handle_message(mesh, other))
+            self.assertTrue(await bot.handle_message(mesh, resent))
             self.assertEqual(len(mesh.commands.attempts), 2)
 
     async def test_unknown_dm_sender_receives_flood_reply_and_advert_request(self):
@@ -417,13 +407,13 @@ class RoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             bot, mesh, _contact = self.make_bot_and_mesh(directory)
             message = weatherbot.InboundMessage(
-                "wx 60601", sender_prefix="313233343536"
+                "wx 60601", sender_prefix="313233343536", sender_timestamp=100
             )
             bot._recent_acks.append(mesh.commands.ack.hex())
             self.assertTrue(await bot.handle_message(mesh, message))
             self.assertEqual(len(mesh.commands.attempts), 1)
 
-            key = bot._request_key(message, "60601")
+            key = bot._request_key(message)
             bot._seen_requests[key] = time.monotonic() - 1
 
             bot._recent_acks.append(mesh.commands.ack.hex())
@@ -438,7 +428,7 @@ class RoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
             commands = FakeSetupCommands()
             mesh = FakeMesh(commands)
             message = weatherbot.InboundMessage(
-                "Alice: wx 60601", channel_index=1
+                "Alice: wx 60601", channel_index=1, sender_timestamp=100
             )
             self.assertTrue(await bot.handle_message(mesh, message))
             self.assertTrue(await bot.handle_message(mesh, message))
@@ -458,6 +448,10 @@ class FakeSetupCommands:
     async def set_name(self, name):
         self.calls.append(("set_name", name))
         return FakeEvent(EventType.OK)
+
+    async def send_appstart(self):
+        self.calls.append(("send_appstart",))
+        return FakeEvent(EventType.SELF_INFO, {"adv_lat": 30.0, "adv_lon": -90.0})
 
     async def set_channel(self, index, name, secret):
         self.calls.append(("set_channel", index, name, secret))
@@ -492,26 +486,77 @@ class FakeBriefWeather:
 
 
 class MeshAdapterTests(unittest.IsolatedAsyncioTestCase):
-    async def test_message_poll_drains_at_configured_interval(self):
+    async def test_raw_test_channel_path_is_attached_only_on_exact_match(self):
         with tempfile.TemporaryDirectory() as directory:
             bot = weatherbot.WeatherBot(
-                make_config(
-                    Path(directory) / "state.json", companion_poll_seconds=0.001
-                ),
+                make_config(Path(directory) / "state.json"), weather=FakeBriefWeather()
+            )
+            bot._remember_raw_channel_path(100, "ping", "af2b8a10", 1)
+            matched = bot._attach_raw_channel_path(
+                weatherbot.InboundMessage(
+                    "Alice: ping",
+                    channel_index=2,
+                    sender_timestamp=100,
+                    path_len=2,
+                )
+            )
+            unmatched = bot._attach_raw_channel_path(
+                weatherbot.InboundMessage(
+                    "Alice: ping",
+                    channel_index=2,
+                    sender_timestamp=101,
+                    path_len=2,
+                )
+            )
+
+        self.assertEqual(matched.path, "af2b8a10")
+        self.assertEqual(matched.path_hash_mode, 1)
+        self.assertIsNone(unmatched.path)
+        self.assertEqual(weatherbot.route_description(unmatched), "2 hops")
+
+    async def test_direct_distance_requires_known_nondefault_coordinates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot = weatherbot.WeatherBot(
+                make_config(Path(directory) / "state.json"), weather=FakeBriefWeather()
+            )
+            bot._bot_coordinates = (30.0, -90.0)
+            bot._contacts["aabbccddeeff"] = {
+                "public_key": "aabbccddeeff" + "00" * 26,
+                "adv_lat": 30.1,
+                "adv_lon": -90.0,
+            }
+            message = weatherbot.InboundMessage("ping", sender_prefix="aabbccddeeff")
+            distance = bot._direct_distance_miles(message)
+            bot._contacts["aabbccddeeff"]["adv_lat"] = 0.0
+            bot._contacts["aabbccddeeff"]["adv_lon"] = 0.0
+            missing = bot._direct_distance_miles(message)
+
+        self.assertIsNotNone(distance)
+        self.assertAlmostEqual(distance, 6.9, places=1)
+        self.assertIsNone(missing)
+
+    async def test_message_worker_handles_messages_in_arrival_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot = weatherbot.WeatherBot(
+                make_config(Path(directory) / "state.json"),
                 weather=FakeBriefWeather(),
             )
-            disconnected = asyncio.Event()
-            calls = 0
+            received = []
 
-            async def drain(_mesh):
-                nonlocal calls
-                calls += 1
-                disconnected.set()
+            async def record(_mesh, message):
+                received.append(message.text)
 
-            bot._drain_messages = drain
-            await bot._message_poll_loop(object(), disconnected)
+            bot._safe_handle_message = record
+            messages = asyncio.Queue()
+            worker = asyncio.create_task(bot._message_worker(object(), messages))
+            messages.put_nowait(weatherbot.InboundMessage("wx 60601"))
+            messages.put_nowait(weatherbot.InboundMessage("wx 60602"))
+            await messages.join()
+            worker.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await worker
 
-        self.assertEqual(calls, 1)
+        self.assertEqual(received, ["wx 60601", "wx 60602"])
 
     async def test_safe_handler_logs_inbound_metadata_without_message_text(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -677,8 +722,16 @@ class CommandFeatureTests(unittest.IsolatedAsyncioTestCase):
             weatherbot.format_ping_response(message),
             "🏓 Pong\n"
             "Received: 2026-08-24T12:00:00+00:00\n"
-            "Path: aa > bb > cc > dd",
+            "Path: AA-BB-CC-DD",
         )
+        wide_path = weatherbot.InboundMessage("ping", path="af2b8a10", path_hash_mode=1)
+        self.assertEqual(weatherbot.route_description(wide_path), "AF2B-8A10")
+        distance_message = weatherbot.InboundMessage("ping", approx_direct_miles=12.34)
+        self.assertEqual(
+            weatherbot.format_ping_response(distance_message).splitlines()[-1],
+            "Approx. direct distance: 12.3 mi",
+        )
+        self.assertEqual(weatherbot.ping_response_data(distance_message)["approx_direct_miles"], 12.3)
         encoded = {"type": "test", "message": "☀" * 100}
         chunks = weatherbot.split_mesh_json(encoded)
         self.assertTrue(all(len(chunk.encode("utf-8")) <= 140 for chunk in chunks))

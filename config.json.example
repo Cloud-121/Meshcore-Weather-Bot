@@ -12,8 +12,6 @@
 
   "alert_zip_codes": ["60601", "63101"],
   "alert_poll_seconds": 60,
-  "companion_poll_seconds": 30,
-
   "direct_retries": 3,
   "ack_timeout_seconds": 5,
   "reconnect_seconds": 5,

@@ -17,7 +17,13 @@ repeat it to add more ZIPs. Every report alert is sent by DM and ends with
 `wx report stop`, which removes all of that identity's subscriptions. In `#Weather`,
 the report command tells the user to use a DM instead. `ping` works in a DM or in
 `#test`, returning `pong`, the bot receipt time, and the best route data the companion
-provides. `ping json` is also available for structured diagnostic output.
+provides. For `#test` packets the bot shows raw route hashes when the companion's RF
+log includes a matching packet (for example, `AF-2B-8A` or `AF2B-8A10`); otherwise it
+falls back to hop count. DM pings use the reliable hop-count fallback because their
+encrypted raw packets cannot be matched safely. When both the bot and a DM sender have
+advertised GPS coordinates, `ping` also shows their approximate straight-line distance;
+this is not the distance through relay nodes. `ping json` is also available for
+structured diagnostic output.
 
 Before a DM reply the bot
 refreshes the sender's route from its newest advert path (`get_advert_path`), then uses
@@ -84,9 +90,8 @@ that are already active. DM report subscriptions and per-user delivery history l
 the same state file; a new subscription also receives any currently active alert.
 Polling cannot be configured below 30 seconds, matching NWS rate-limit guidance.
 Use only real five-digit ZIP codes in this list; use `[]` to disable automatic channel
-alerts. `companion_poll_seconds` (default 30) periodically fetches queued mesh
-messages and keeps the companion TCP connection active when it would otherwise idle
-out. Set `log_level` to `DEBUG` to see inbound-message metadata and command detection.
+alerts. Queued mesh messages are fetched when the companion reports they are waiting.
+Set `log_level` to `DEBUG` to see inbound-message metadata and command detection.
 
 Test the Internet-side lookup without a repeater:
 
