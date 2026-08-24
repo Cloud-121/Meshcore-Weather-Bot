@@ -601,6 +601,11 @@ class WeatherBot:
                     f"{actual_test or 'unconfigured'!r}, not {expected_test!r}"
                 )
 
+            # MeshCore otherwise keeps RF logs encrypted and exposes only the
+            # companion's hop count.  With the verified channel keys loaded,
+            # it can correlate a raw #test packet with its delivered message.
+            mesh.set_decrypt_channel_logs(True)
+
             await self._refresh_contacts_unlocked(mesh)
             if not self._advertised:
                 self._require_event(

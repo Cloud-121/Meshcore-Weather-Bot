@@ -287,6 +287,10 @@ class FakeRoutingCommands:
 class FakeMesh:
     def __init__(self, commands):
         self.commands = commands
+        self.decrypt_channel_logs = False
+
+    def set_decrypt_channel_logs(self, enabled):
+        self.decrypt_channel_logs = enabled
 
 
 class RoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
@@ -560,10 +564,12 @@ class MeshAdapterTests(unittest.IsolatedAsyncioTestCase):
             )
             bot = weatherbot.WeatherBot(config, weather=FakeBriefWeather())
             commands = FakeSetupCommands()
-            await bot._prepare_mesh(FakeMesh(commands))
+            mesh = FakeMesh(commands)
+            await bot._prepare_mesh(mesh)
         self.assertIn(("set_channel", 1, "Weather", key), commands.calls)
         self.assertIn(("send_advert", True), commands.calls)
         self.assertIn("aabbccddeeff", bot._contacts)
+        self.assertTrue(mesh.decrypt_channel_logs)
 
     async def test_channel_request_replies_to_weather_channel(self):
         with tempfile.TemporaryDirectory() as directory:
