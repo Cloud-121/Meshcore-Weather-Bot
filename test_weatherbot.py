@@ -30,6 +30,7 @@ def make_config(state_file, **changes):
         test_channel_name="test",
         alert_zip_codes=[],
         alert_poll_seconds=60,
+        message_poll_seconds=2,
         direct_retries=3,
         ack_timeout_seconds=0.001,
         reconnect_seconds=1,
@@ -226,7 +227,7 @@ class WeatherFormattingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ConfigurationTests(unittest.TestCase):
-    def test_legacy_companion_poll_setting_is_ignored(self):
+    def test_message_poll_defaults_and_legacy_setting_is_ignored(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
             path.write_text(
@@ -242,6 +243,19 @@ class ConfigurationTests(unittest.TestCase):
             self.assertFalse(
                 hasattr(weatherbot.load_config(path), "companion_poll_seconds")
             )
+            self.assertEqual(weatherbot.load_config(path).message_poll_seconds, 2)
+
+            path.write_text(
+                json.dumps(
+                    {
+                        "noaa_user_agent": "weatherbot-tests (tests@example.com)",
+                        "message_poll_seconds": 0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(SystemExit, "message_poll_seconds"):
+                weatherbot.load_config(path)
 
 
 class FakeRoutingCommands:
@@ -489,7 +503,60 @@ class FakeBriefWeather:
         return f"WX {zip_code}: Clear, 72F. No active NWS alerts."
 
 
+class FakeQueuedMessageCommands:
+    def __init__(self, events):
+        self.events = list(events)
+        self.get_msg_calls = 0
+
+    async def get_msg(self):
+        self.get_msg_calls += 1
+        return self.events.pop(0)
+
+
+class FakeQueuedMessageMesh:
+    def __init__(self, events):
+        self.commands = FakeQueuedMessageCommands(events)
+        self.connection_manager = type("Connection", (), {"is_connected": True})()
+
+
 class MeshAdapterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_message_sync_drains_until_no_more_messages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot = weatherbot.WeatherBot(
+                make_config(Path(directory) / "state.json"), weather=FakeBriefWeather()
+            )
+            mesh = FakeQueuedMessageMesh(
+                [
+                    FakeEvent(EventType.CONTACT_MSG_RECV),
+                    FakeEvent(EventType.CHANNEL_MSG_RECV),
+                    FakeEvent(EventType.NO_MORE_MSGS),
+                ]
+            )
+            await bot._drain_messages(mesh)
+
+        self.assertEqual(mesh.commands.get_msg_calls, 3)
+
+    async def test_message_poll_syncs_when_no_wake_notification_arrives(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot = weatherbot.WeatherBot(
+                make_config(
+                    Path(directory) / "state.json", message_poll_seconds=0.001
+                ),
+                weather=FakeBriefWeather(),
+            )
+            disconnected = asyncio.Event()
+            calls = 0
+
+            async def drain(_mesh):
+                nonlocal calls
+                calls += 1
+                disconnected.set()
+
+            bot._drain_messages = drain
+            await bot._message_poll_loop(object(), disconnected)
+
+        self.assertEqual(calls, 1)
+
     async def test_raw_test_channel_path_is_attached_only_on_exact_match(self):
         with tempfile.TemporaryDirectory() as directory:
             bot = weatherbot.WeatherBot(

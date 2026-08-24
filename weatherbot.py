@@ -101,6 +101,7 @@ class BotConfig:
     test_channel_name: str
     alert_zip_codes: list[str]
     alert_poll_seconds: int
+    message_poll_seconds: float
     direct_retries: int
     ack_timeout_seconds: float
     reconnect_seconds: float
@@ -534,15 +535,20 @@ class WeatherBot:
                 )
             )
         alert_task: Optional[asyncio.Task[Any]] = None
+        message_poll_task: Optional[asyncio.Task[Any]] = None
         try:
             await self._prepare_mesh(mesh)
             await self._drain_messages(mesh)
+            message_poll_task = asyncio.create_task(
+                self._message_poll_loop(mesh, disconnected),
+                name="weatherbot-message-poll",
+            )
             alert_task = asyncio.create_task(
                 self._alert_loop(mesh), name="weatherbot-alerts"
             )
             await disconnected.wait()
         finally:
-            for task in (alert_task,):
+            for task in (message_poll_task, alert_task):
                 if task is None:
                     continue
                 task.cancel()
@@ -677,6 +683,23 @@ class WeatherBot:
                     EventType.CHANNEL_MSG_RECV,
                 ):
                     raise MeshError(f"unexpected queued-message response: {result.type}")
+
+    async def _message_poll_loop(self, mesh: Any, disconnected: asyncio.Event) -> None:
+        """Periodically issue CMD_SYNC_NEXT_MESSAGE for companions without wake pushes."""
+        while not disconnected.is_set():
+            try:
+                await asyncio.wait_for(
+                    disconnected.wait(), timeout=self.config.message_poll_seconds
+                )
+                return
+            except asyncio.TimeoutError:
+                pass
+            try:
+                await self._drain_messages(mesh)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                LOG.warning("Companion message sync failed: %s", exc)
 
     async def _safe_handle_message(self, mesh: Any, message: InboundMessage) -> None:
         try:
@@ -1525,6 +1548,7 @@ def load_config(path: Path) -> BotConfig:
         test_channel_name=str(raw.get("test_channel_name", "test")).lstrip("#"),
         alert_zip_codes=list(dict.fromkeys(zip_codes)),
         alert_poll_seconds=int(raw.get("alert_poll_seconds", 60)),
+        message_poll_seconds=float(raw.get("message_poll_seconds", 2)),
         direct_retries=int(raw.get("direct_retries", 3)),
         ack_timeout_seconds=float(raw.get("ack_timeout_seconds", 5)),
         reconnect_seconds=float(raw.get("reconnect_seconds", 5)),
@@ -1550,6 +1574,8 @@ def load_config(path: Path) -> BotConfig:
         raise SystemExit("bot_name must be 1-31 UTF-8 bytes")
     if config.alert_poll_seconds < 30:
         raise SystemExit("alert_poll_seconds must be at least 30")
+    if config.message_poll_seconds <= 0:
+        raise SystemExit("message_poll_seconds must be positive")
     if not 0 <= config.direct_retries <= 10:
         raise SystemExit("direct_retries must be between 0 and 10")
     if config.ack_timeout_seconds <= 0 or config.reconnect_seconds <= 0:

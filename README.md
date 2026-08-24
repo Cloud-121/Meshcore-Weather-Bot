@@ -90,8 +90,9 @@ that are already active. DM report subscriptions and per-user delivery history l
 the same state file; a new subscription also receives any currently active alert.
 Polling cannot be configured below 30 seconds, matching NWS rate-limit guidance.
 Use only real five-digit ZIP codes in this list; use `[]` to disable automatic channel
-alerts. Queued mesh messages are fetched when the companion reports they are waiting.
-Set `log_level` to `DEBUG` to see inbound-message metadata and command detection.
+alerts. `message_poll_seconds` (default 2) periodically sends the companion
+`CMD_SYNC_NEXT_MESSAGE`, because a wake notification is optional. Set `log_level` to
+`DEBUG` to see inbound-message metadata and command detection.
 
 Test the Internet-side lookup without a repeater:
 
