@@ -43,7 +43,6 @@ wx ZIPCODE: weather report
 wx report ZIPCODE: DM alert signup
 wx report stop: stop DM alerts
 wx version: running Git commit
-Add json for structured output
 ping: DM or #test
 ```
 

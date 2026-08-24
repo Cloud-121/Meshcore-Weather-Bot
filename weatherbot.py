@@ -43,7 +43,6 @@ HELP_TEXT = (
     "wx report ZIPCODE: DM alert signup\n"
     "wx report stop: stop DM alerts\n"
     "wx version: running Git commit\n"
-    "Add json for structured output\n"
     "ping: DM or #test"
 )
 REPORT_STOP_TEXT = "To stop these alerts: wx report stop"
