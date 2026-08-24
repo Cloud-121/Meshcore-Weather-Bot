@@ -453,7 +453,6 @@ class WeatherBot:
 
     async def _serve_connection(self, mesh: Any) -> None:
         disconnected = asyncio.Event()
-        inbound_messages: asyncio.Queue[InboundMessage] = asyncio.Queue()
 
         def remember_ack(event: Any) -> None:
             code = str((event.payload or {}).get("code") or event.attributes.get("code") or "")
@@ -478,8 +477,9 @@ class WeatherBot:
                     sender_timestamp=integer_or_none(payload.get("sender_timestamp")),
                     received_at=datetime.now(tz=ZoneInfo("UTC")),
                 )
-            await inbound_messages.put(
-                replace(message, approx_direct_miles=self._direct_distance_miles(message))
+            await self._safe_handle_message(
+                mesh,
+                replace(message, approx_direct_miles=self._direct_distance_miles(message)),
             )
 
         async def handle_channel(event: Any) -> None:
@@ -493,7 +493,7 @@ class WeatherBot:
                     sender_timestamp=integer_or_none(payload.get("sender_timestamp")),
                     received_at=datetime.now(tz=ZoneInfo("UTC")),
                 )
-            await inbound_messages.put(self._attach_raw_channel_path(message))
+            await self._safe_handle_message(mesh, self._attach_raw_channel_path(message))
 
         async def remember_raw_channel_path(event: Any) -> None:
             payload = event.payload or {}
@@ -534,20 +534,15 @@ class WeatherBot:
                 )
             )
         alert_task: Optional[asyncio.Task[Any]] = None
-        message_worker_task: Optional[asyncio.Task[Any]] = None
         try:
             await self._prepare_mesh(mesh)
             await self._drain_messages(mesh)
-            message_worker_task = asyncio.create_task(
-                self._message_worker(mesh, inbound_messages),
-                name="weatherbot-message-worker",
-            )
             alert_task = asyncio.create_task(
                 self._alert_loop(mesh), name="weatherbot-alerts"
             )
             await disconnected.wait()
         finally:
-            for task in (message_worker_task, alert_task):
+            for task in (alert_task,):
                 if task is None:
                     continue
                 task.cancel()
@@ -677,17 +672,6 @@ class WeatherBot:
                     EventType.CHANNEL_MSG_RECV,
                 ):
                     raise MeshError(f"unexpected queued-message response: {result.type}")
-
-    async def _message_worker(
-        self, mesh: Any, inbound_messages: asyncio.Queue[InboundMessage]
-    ) -> None:
-        """Handle incoming messages in the order MeshCore delivered them."""
-        while True:
-            message = await inbound_messages.get()
-            try:
-                await self._safe_handle_message(mesh, message)
-            finally:
-                inbound_messages.task_done()
 
     async def _safe_handle_message(self, mesh: Any, message: InboundMessage) -> None:
         try:

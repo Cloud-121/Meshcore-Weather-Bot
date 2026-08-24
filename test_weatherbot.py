@@ -535,29 +535,6 @@ class MeshAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(distance, 6.9, places=1)
         self.assertIsNone(missing)
 
-    async def test_message_worker_handles_messages_in_arrival_order(self):
-        with tempfile.TemporaryDirectory() as directory:
-            bot = weatherbot.WeatherBot(
-                make_config(Path(directory) / "state.json"),
-                weather=FakeBriefWeather(),
-            )
-            received = []
-
-            async def record(_mesh, message):
-                received.append(message.text)
-
-            bot._safe_handle_message = record
-            messages = asyncio.Queue()
-            worker = asyncio.create_task(bot._message_worker(object(), messages))
-            messages.put_nowait(weatherbot.InboundMessage("wx 60601"))
-            messages.put_nowait(weatherbot.InboundMessage("wx 60602"))
-            await messages.join()
-            worker.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await worker
-
-        self.assertEqual(received, ["wx 60601", "wx 60602"])
-
     async def test_safe_handler_logs_inbound_metadata_without_message_text(self):
         with tempfile.TemporaryDirectory() as directory:
             bot = weatherbot.WeatherBot(
