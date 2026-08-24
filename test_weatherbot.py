@@ -114,6 +114,23 @@ class WeatherFormattingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("⚠️ Heat Advisory", report)
         self.assertEqual(service.alert_params, {"point": "41.8858,-87.6181"})
 
+    async def test_weather_json_is_a_compact_text_summary(self):
+        service = FakeWeatherService()
+        report = await service.weather_json("60601")
+        await service.close()
+        self.assertEqual(
+            report,
+            {
+                "z": "60601",
+                "l": "Chicago, IL",
+                "t": 68,
+                "c": "Partly Cloudy",
+                "h": 50,
+                "w": "SW 10 mph",
+                "a": [["Heat Advisory", "Moderate", "Aug 20 8:00 PM CDT"]],
+            },
+        )
+
     async def test_report_lines_fit_mesh_limit(self):
         service = FakeWeatherService()
         report = await service.weather_report("60601")
@@ -162,7 +179,7 @@ class WeatherFormattingTests(unittest.IsolatedAsyncioTestCase):
         message = weatherbot.format_channel_alert(alert, ["60601", "60602"])
         body = message.split("\n", 2)[2]
         self.assertEqual(len(body), 2000)
-        self.assertTrue(message.startswith("🚨 NWS ALERT — 60601,60602"))
+        self.assertTrue(message.startswith("🚨 NWS ALERT: 60601,60602"))
         self.assertTrue(body.startswith("Description sentence."))
 
     async def test_format_channel_alert_appends_instruction_when_short(self):
@@ -656,7 +673,12 @@ class CommandFeatureTests(unittest.IsolatedAsyncioTestCase):
             path_hash_mode=0,
             received_at=weatherbot.datetime(2026, 8, 24, 12, 0, tzinfo=weatherbot.ZoneInfo("UTC")),
         )
-        self.assertIn("aa > bb > cc > dd", weatherbot.format_ping_response(message))
+        self.assertEqual(
+            weatherbot.format_ping_response(message),
+            "🏓 Pong\n"
+            "Received: 2026-08-24T12:00:00+00:00\n"
+            "Path: aa > bb > cc > dd",
+        )
         encoded = {"type": "test", "message": "☀" * 100}
         chunks = weatherbot.split_mesh_json(encoded)
         self.assertTrue(all(len(chunk.encode("utf-8")) <= 140 for chunk in chunks))

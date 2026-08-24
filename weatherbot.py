@@ -35,14 +35,13 @@ WX_REPORT_COMMAND = re.compile(
 )
 PING_COMMAND = re.compile(r"\s*ping(?:\s+(json))?\s*", re.IGNORECASE)
 HELP_TEXT = (
-    "Companion\n"
-    "Gulf Coast Mesh boat, Designed by ScarlettOSA\n"
-    "wx ZIPCODE — weather report\n"
-    "wx report ZIPCODE — DM alert signup\n"
-    "wx report stop — stop DM alerts\n"
-    "wx version — running Git commit\n"
+    "Gulf Coast Mesh Bot, Designed by ScarlettOSA\n"
+    "wx ZIPCODE: weather report\n"
+    "wx report ZIPCODE: DM alert signup\n"
+    "wx report stop: stop DM alerts\n"
+    "wx version: running Git commit\n"
     "Add json for structured output\n"
-    "ping — DM or #test"
+    "ping: DM or #test"
 )
 REPORT_STOP_TEXT = "To stop these alerts: wx report stop"
 UNKNOWN_SENDER_NOTICE = (
@@ -223,10 +222,10 @@ class WeatherService:
         return "\n".join(lines)
 
     async def weather_json(self, zip_code: str) -> dict[str, Any]:
-        """Return compact structured weather data suitable for mesh JSON replies."""
+        """Return the small weather summary shown in the text report."""
         location = await self.resolve_zip(zip_code)
         conditions: dict[str, Any] = {}
-        source = "unavailable"
+        source = ""
         if location.station_url:
             try:
                 observation = await self._get_json(
@@ -246,19 +245,63 @@ class WeatherService:
             except WeatherError:
                 pass
         alerts = await self.active_alerts(location)
-        return {
-            "type": "weather",
-            "location": {
-                "zip_code": location.zip_code,
-                "city": location.city,
-                "state": location.state,
-                "latitude": location.latitude,
-                "longitude": location.longitude,
-            },
-            "conditions_source": source,
-            "conditions": conditions,
-            "alerts": alerts,
+        report: dict[str, Any] = {
+            "z": location.zip_code,
+            "l": f"{location.city}, {location.state}",
         }
+
+        if source == "observation":
+            temperature = quantity(conditions.get("temperature"))
+            if temperature is not None:
+                report["t"] = round(
+                    to_fahrenheit(temperature, unit_code(conditions.get("temperature")))
+                )
+            description = clean_text(str(conditions.get("textDescription") or ""))
+            if description:
+                report["c"] = description
+            humidity = quantity(conditions.get("relativeHumidity"))
+            if humidity is not None:
+                report["h"] = round(humidity)
+            wind = quantity(conditions.get("windSpeed"))
+            if wind is not None:
+                mph = to_mph(wind, unit_code(conditions.get("windSpeed")))
+                if mph < 1:
+                    report["w"] = "calm"
+                else:
+                    direction = quantity(conditions.get("windDirection"))
+                    compass = degrees_to_compass(direction) if direction is not None else ""
+                    report["w"] = f"{compass} {round(mph)} mph".strip()
+        elif source == "hourly_forecast":
+            temperature = conditions.get("temperature")
+            if temperature is not None:
+                value = float(temperature)
+                if str(conditions.get("temperatureUnit") or "F").upper() == "C":
+                    value = value * 9 / 5 + 32
+                report["t"] = round(value)
+            forecast = clean_text(str(conditions.get("shortForecast") or ""))
+            if forecast:
+                report["c"] = forecast
+            wind = clean_text(
+                f"{conditions.get('windDirection') or ''} {conditions.get('windSpeed') or ''}"
+            )
+            if wind:
+                report["w"] = wind
+
+        alert_summaries: list[list[str]] = []
+        for alert in alerts:
+            properties = alert.get("properties") or {}
+            event = clean_text(str(properties.get("event") or "Weather Alert"))
+            severity = clean_text(str(properties.get("severity") or "Unknown"))
+            summary = [event, severity]
+            ends = format_alert_time(
+                properties.get("ends") or properties.get("expires"),
+                str(properties.get("timeZone") or ""),
+            )
+            if ends:
+                summary.append(ends)
+            alert_summaries.append(summary)
+        report["a"] = alert_summaries
+        return report
 
     async def _current_conditions(self, location: Location) -> list[str]:
         if location.station_url:
@@ -663,7 +706,7 @@ class WeatherBot:
         version_match = WX_VERSION_COMMAND.fullmatch(command)
         if version_match:
             version = git_commit()
-            response = {"type": "version", "git_commit": version} if version_match.group(1) else f"WeatherBot version: {version}"
+            response = {"type": "version", "git_commit": version} if version_match.group(1) else f"Gulf Coast Mesh Bot version: {version}"
             await self._reply(mesh, message, response)
             return True
 
@@ -1155,14 +1198,14 @@ def ping_response_data(message: InboundMessage) -> dict[str, Any]:
 
 def format_ping_response(message: InboundMessage) -> str:
     data = ping_response_data(message)
-    return f"pong — received {data['received_at']}\npath: {data['path']}"
+    return f"🏓 Pong\nReceived: {data['received_at']}\nPath: {data['path']}"
 
 
 def help_response_data() -> dict[str, Any]:
     return {
         "type": "help",
-        "service": "Companion",
-        "attribution": "Gulf Coast Mesh boat, Designed by ScarlettOSA",
+        "service": "Gulf Coast Mesh Bot",
+        "attribution": "Designed by ScarlettOSA",
         "commands": [
             "wx ZIPCODE",
             "wx report ZIPCODE",
@@ -1292,7 +1335,7 @@ def format_channel_alert(alert: dict[str, Any], zip_codes: Sequence[str]) -> str
     instruction = clean_text(str(properties.get("instruction") or ""))
     timing = f", until {ends}" if ends else ""
     zips = ",".join(sorted(set(zip_codes)))
-    lines = [f"🚨 NWS ALERT — {zips}", f"⚠️ {event} ({severity}, {urgency}{timing})"]
+    lines = [f"🚨 NWS ALERT: {zips}", f"⚠️ {event} ({severity}, {urgency}{timing})"]
     body = description or headline or event
     if instruction and instruction.casefold() not in body.casefold():
         body = f"{body} {instruction}" if body else instruction
