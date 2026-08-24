@@ -45,6 +45,10 @@ HELP_TEXT = (
     "ping — DM or #test"
 )
 REPORT_STOP_TEXT = "To stop these alerts: wx report stop"
+UNKNOWN_SENDER_NOTICE = (
+    "⚠️ This reply was flood-sent because I do not have your advert. "
+    "Please send an advert for reliable future replies."
+)
 
 
 class MeshError(RuntimeError):
@@ -705,6 +709,15 @@ class WeatherBot:
     async def _reply(
         self, mesh: Any, message: InboundMessage, response: str | dict[str, Any]
     ) -> None:
+        if not message.is_channel:
+            if not message.sender_prefix:
+                raise MeshError("a queued DM did not include its sender key prefix")
+            if not await self._has_contact(mesh, message.sender_prefix):
+                response = (
+                    {**response, "delivery_warning": UNKNOWN_SENDER_NOTICE}
+                    if isinstance(response, dict)
+                    else f"{response}\n\n{UNKNOWN_SENDER_NOTICE}"
+                )
         chunks = (
             split_mesh_json(response)
             if isinstance(response, dict)
@@ -742,6 +755,18 @@ class WeatherBot:
 
         async with self._mesh_lock:
             contact = await self._find_contact_unlocked(mesh, prefix)
+            if contact is None:
+                result = self._require_event(
+                    await mesh.commands.send_msg(
+                        prefix, text, timestamp=timestamp, attempt=0
+                    ),
+                    EventType.MSG_SENT,
+                    "flooding a DM to an unknown sender",
+                )
+                if int(result.payload.get("type", 0)) != 1:
+                    raise MeshError("companion did not flood the unknown-sender DM")
+                LOG.warning("Flood-sent DM to unknown sender %s", prefix)
+                return True
             await self._refresh_path_unlocked(mesh, contact, prefix)
             for attempt in range(self.config.direct_retries + 1):
                 result = await mesh.commands.send_msg(
@@ -870,15 +895,18 @@ class WeatherBot:
             except asyncio.TimeoutError:
                 return False
 
+    async def _has_contact(self, mesh: Any, prefix: str | bytes) -> bool:
+        normalized = (prefix.hex() if isinstance(prefix, bytes) else prefix).lower()
+        async with self._mesh_lock:
+            return await self._find_contact_unlocked(mesh, normalized) is not None
+
     async def _find_contact_unlocked(
         self, mesh: Any, prefix: str
-    ) -> dict[str, Any]:
+    ) -> Optional[dict[str, Any]]:
         contact = self._contacts.get(prefix[:12])
         if contact is None:
             await self._refresh_contacts_unlocked(mesh)
             contact = self._contacts.get(prefix[:12])
-        if contact is None:
-            raise MeshError(f"cannot find contact for sender {prefix[:12]}")
         return contact
 
     async def _refresh_contacts_unlocked(self, mesh: Any) -> None:

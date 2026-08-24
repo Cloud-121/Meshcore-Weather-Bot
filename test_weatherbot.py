@@ -223,11 +223,14 @@ class FakeRoutingCommands:
         return FakeEvent(
             EventType.MSG_SENT,
             {
-                "type": 1 if self.flood else 0,
+                "type": 1 if self.flood or isinstance(contact, str) else 0,
                 "expected_ack": self.ack,
                 "suggested_timeout": 1,
             },
         )
+
+    async def get_contacts(self):
+        return FakeEvent(EventType.CONTACTS, {})
 
     async def get_advert_path(self, contact):
         self.advert_path_calls.append(contact)
@@ -332,6 +335,37 @@ class RoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
             bot._recent_acks.append(mesh.commands.ack.hex())
             self.assertTrue(await bot.handle_message(mesh, other))
             self.assertEqual(len(mesh.commands.attempts), 2)
+
+    async def test_unknown_dm_sender_receives_flood_reply_and_advert_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot = weatherbot.WeatherBot(
+                make_config(Path(directory) / "state.json"), weather=FakeBriefWeather()
+            )
+            mesh = FakeMesh(FakeRoutingCommands())
+            message = weatherbot.InboundMessage(
+                "wx 60601", sender_prefix="aabbccddeeff"
+            )
+            self.assertTrue(await bot.handle_message(mesh, message))
+
+        attempts = mesh.commands.attempts
+        self.assertGreaterEqual(len(attempts), 1)
+        self.assertTrue(all(item[0] == "aabbccddeeff" for item in attempts))
+        self.assertIn("Please send an advert", "".join(item[1] for item in attempts))
+        self.assertEqual(mesh.commands.advert_path_calls, [])
+
+    async def test_known_dm_reply_does_not_include_unknown_sender_notice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot, mesh, _contact = self.make_bot_and_mesh(directory)
+            bot._recent_acks.append(mesh.commands.ack.hex())
+            self.assertTrue(
+                await bot.handle_message(
+                    mesh,
+                    weatherbot.InboundMessage(
+                        "wx 60601", sender_prefix="313233343536"
+                    ),
+                )
+            )
+        self.assertNotIn("Please send an advert", mesh.commands.attempts[0][1])
 
     async def test_dedup_window_expiry_allows_new_request(self):
         with tempfile.TemporaryDirectory() as directory:
