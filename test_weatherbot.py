@@ -26,6 +26,8 @@ def make_config(state_file, **changes):
         weather_channel_index=1,
         weather_channel_name="Weather",
         weather_channel_key="",
+        test_channel_index=2,
+        test_channel_name="test",
         alert_zip_codes=[],
         alert_poll_seconds=60,
         direct_retries=3,
@@ -385,7 +387,10 @@ class FakeSetupCommands:
         self.calls.append(("get_channel", index))
         return FakeEvent(
             EventType.CHANNEL_INFO,
-            {"channel_idx": index, "channel_name": "Weather"},
+            {
+                "channel_idx": index,
+                "channel_name": "Weather" if index == 1 else "test",
+            },
         )
 
     async def get_contacts(self):
@@ -477,6 +482,88 @@ class AlertPollingTests(unittest.IsolatedAsyncioTestCase):
             restarted = weatherbot.WeatherBot(config, weather=FakeAlertWeather())
             self.assertEqual(await restarted.poll_alerts(mesh), 0)
             self.assertTrue(json.loads(state.read_text())["seen_alerts"])
+
+
+class CommandFeatureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_report_subscriptions_persist_and_stop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state.json"
+            bot = weatherbot.WeatherBot(
+                make_config(state), weather=FakeBriefWeather()
+            )
+            contact = {
+                "public_key": "313233343536" + "00" * 26,
+                "out_path_len": -1,
+            }
+            bot._contacts["313233343536"] = contact
+            commands = FakeRoutingCommands()
+            commands.flood = True
+            mesh = FakeMesh(commands)
+
+            self.assertTrue(
+                await bot.handle_message(
+                    mesh,
+                    weatherbot.InboundMessage(
+                        "wx report 70818", sender_prefix="313233343536"
+                    ),
+                )
+            )
+            self.assertEqual(bot._report_subscriptions["313233343536"], ["70818"])
+            restarted = weatherbot.WeatherBot(
+                make_config(state), weather=FakeBriefWeather()
+            )
+            self.assertEqual(restarted._report_subscriptions["313233343536"], ["70818"])
+
+            restarted._contacts["313233343536"] = contact
+            self.assertTrue(
+                await restarted.handle_message(
+                    mesh,
+                    weatherbot.InboundMessage(
+                        "wx report stop", sender_prefix="313233343536"
+                    ),
+                )
+            )
+            self.assertNotIn("313233343536", restarted._report_subscriptions)
+
+    async def test_personal_alert_is_sent_once_with_stop_instruction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state.json"
+            bot = weatherbot.WeatherBot(
+                make_config(state), weather=FakeAlertWeather()
+            )
+            bot._report_subscriptions["313233343536"] = ["60601"]
+            bot._contacts["313233343536"] = {
+                "public_key": "313233343536" + "00" * 26,
+                "out_path_len": -1,
+            }
+            commands = FakeRoutingCommands()
+            commands.flood = True
+            mesh = FakeMesh(commands)
+            self.assertEqual(await bot.poll_alerts(mesh), 1)
+            self.assertIn(
+                "To stop these alerts: wx report stop",
+                "".join(item[1] for item in commands.attempts),
+            )
+            sent = len(commands.attempts)
+            self.assertEqual(await bot.poll_alerts(mesh), 0)
+            self.assertEqual(len(commands.attempts), sent)
+
+    async def test_ping_and_json_helpers(self):
+        message = weatherbot.InboundMessage(
+            "ping",
+            channel_index=2,
+            path="aabbccdd",
+            path_hash_mode=0,
+            received_at=weatherbot.datetime(2026, 8, 24, 12, 0, tzinfo=weatherbot.ZoneInfo("UTC")),
+        )
+        self.assertIn("aa > bb > cc > dd", weatherbot.format_ping_response(message))
+        encoded = {"type": "test", "message": "☀" * 100}
+        chunks = weatherbot.split_mesh_json(encoded)
+        self.assertTrue(all(len(chunk.encode("utf-8")) <= 140 for chunk in chunks))
+        self.assertEqual(json.loads("".join(chunks)), encoded)
+        self.assertEqual(weatherbot.parse_wx_request("wx 70818 json"), ("70818", True))
+        self.assertEqual(weatherbot.help_response_data()["type"], "help")
+        self.assertRegex(weatherbot.git_commit(), r"^[0-9a-f]{40}$|^unknown$")
 
 
 if __name__ == "__main__":

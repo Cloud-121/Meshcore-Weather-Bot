@@ -6,7 +6,20 @@ of the repeater's companion TCP ports through the maintained
 [`meshcore` Python client](https://github.com/meshcore-dev/meshcore_py); it does not
 need `openhop_core` or a separate radio.
 
-It responds to exactly `wx ZIPCODE` in a DM or in `#Weather`. Before a DM reply the bot
+It responds to `wx ZIPCODE` in a DM or in `#Weather`. `wx help` lists commands and
+identifies the bot as a Gulf Coast Mesh boat designed by ScarlettOSA. `wx version`
+reports the Git commit currently running. Append `json` to any `wx` command (for
+example, `wx 70818 json` or `wx help json`) to receive a compact structured JSON
+response instead of the normal text reply.
+
+Use `wx report ZIPCODE` in a DM to subscribe that identity to NOAA alerts for a ZIP;
+repeat it to add more ZIPs. Every report alert is sent by DM and ends with
+`wx report stop`, which removes all of that identity's subscriptions. In `#Weather`,
+the report command tells the user to use a DM instead. `ping` works in a DM or in
+`#test`, returning `pong`, the bot receipt time, and the best route data the companion
+provides. `ping json` is also available for structured diagnostic output.
+
+Before a DM reply the bot
 refreshes the sender's route from its newest advert path (`get_advert_path`), then uses
 that route and waits for the MeshCore ACK. It makes the initial routed attempt plus the
 configured three retries. If none is acknowledged, it resets that stale outbound route
@@ -46,6 +59,10 @@ You can do that in a companion app/dashboard, or put the Base64 key in
 to 24 Base64 characters. Leave the value empty to use the channel already stored by
 the repeater. The bot verifies the channel name before transmitting.
 
+Also configure `test_channel_index` as `test` (or set both matching values in
+`config.json`). The bot verifies that channel at startup and uses it only for public
+`ping`; its encryption key must already be configured on the companion.
+
 ## 2. Configure and run
 
 Use Python 3.10 or newer and install the two declared runtime dependencies in a
@@ -63,8 +80,9 @@ python weatherbot.py --config config.json
 The `alert_zip_codes` list controls automatic alert monitoring. New active NWS alerts
 are combined across matching ZIPs, sent once to `#Weather`, and recorded in
 `.weatherbot_state.json` so a restart does not repeat them. The first run sends alerts
-that are already active. Polling cannot be configured below 30 seconds, matching NWS
-rate-limit guidance.
+that are already active. DM report subscriptions and per-user delivery history live in
+the same state file; a new subscription also receives any currently active alert.
+Polling cannot be configured below 30 seconds, matching NWS rate-limit guidance.
 
 Test the Internet-side lookup without a repeater:
 

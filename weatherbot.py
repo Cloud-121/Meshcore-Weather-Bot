@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import time
 from collections import deque
@@ -26,7 +27,24 @@ from meshcore import EventType, MeshCore
 
 
 LOG = logging.getLogger("weatherbot")
-WX_COMMAND = re.compile(r"\s*wx\s+(\d{5})(?:-\d{4})?\s*", re.IGNORECASE)
+WX_COMMAND = re.compile(r"\s*wx\s+(\d{5})(?:-\d{4})?(?:\s+(json))?\s*", re.IGNORECASE)
+WX_HELP_COMMAND = re.compile(r"\s*wx\s+help(?:\s+(json))?\s*", re.IGNORECASE)
+WX_VERSION_COMMAND = re.compile(r"\s*wx\s+version(?:\s+(json))?\s*", re.IGNORECASE)
+WX_REPORT_COMMAND = re.compile(
+    r"\s*wx\s+report\s+(stop|(\d{5})(?:-\d{4})?)(?:\s+(json))?\s*", re.IGNORECASE
+)
+PING_COMMAND = re.compile(r"\s*ping(?:\s+(json))?\s*", re.IGNORECASE)
+HELP_TEXT = (
+    "Companion\n"
+    "Gulf Coast Mesh boat, Designed by ScarlettOSA\n"
+    "wx ZIPCODE — weather report\n"
+    "wx report ZIPCODE — DM alert signup\n"
+    "wx report stop — stop DM alerts\n"
+    "wx version — running Git commit\n"
+    "Add json for structured output\n"
+    "ping — DM or #test"
+)
+REPORT_STOP_TEXT = "To stop these alerts: wx report stop"
 
 
 class MeshError(RuntimeError):
@@ -42,6 +60,10 @@ class InboundMessage:
     text: str
     sender_prefix: Optional[str] = None
     channel_index: Optional[int] = None
+    path: Optional[str] = None
+    path_len: Optional[int] = None
+    path_hash_mode: Optional[int] = None
+    received_at: Optional[datetime] = None
 
     @property
     def is_channel(self) -> bool:
@@ -67,6 +89,8 @@ class BotConfig:
     weather_channel_index: int
     weather_channel_name: str
     weather_channel_key: str
+    test_channel_index: int
+    test_channel_name: str
     alert_zip_codes: list[str]
     alert_poll_seconds: int
     direct_retries: int
@@ -193,6 +217,44 @@ class WeatherService:
                 lines.append(f"⚠️ {event} ({severity}{timing})")
         return "\n".join(lines)
 
+    async def weather_json(self, zip_code: str) -> dict[str, Any]:
+        """Return compact structured weather data suitable for mesh JSON replies."""
+        location = await self.resolve_zip(zip_code)
+        conditions: dict[str, Any] = {}
+        source = "unavailable"
+        if location.station_url:
+            try:
+                observation = await self._get_json(
+                    location.station_url.rstrip("/") + "/observations/latest"
+                )
+                conditions = observation.get("properties") or {}
+                source = "observation"
+            except WeatherError:
+                pass
+        if not conditions and location.hourly_url:
+            try:
+                hourly = await self._get_json(location.hourly_url)
+                periods = (hourly.get("properties") or {}).get("periods") or []
+                if periods and isinstance(periods[0], dict):
+                    conditions = periods[0]
+                    source = "hourly_forecast"
+            except WeatherError:
+                pass
+        alerts = await self.active_alerts(location)
+        return {
+            "type": "weather",
+            "location": {
+                "zip_code": location.zip_code,
+                "city": location.city,
+                "state": location.state,
+                "latitude": location.latitude,
+                "longitude": location.longitude,
+            },
+            "conditions_source": source,
+            "conditions": conditions,
+            "alerts": alerts,
+        }
+
     async def _current_conditions(self, location: Location) -> list[str]:
         if location.station_url:
             try:
@@ -293,7 +355,11 @@ class WeatherBot:
         self._recent_acks: deque[str] = deque(maxlen=128)
         self._ack_signal = asyncio.Event()
         self._seen_requests: dict[tuple, float] = {}
-        self._seen_alerts = self._load_seen_alerts()
+        (
+            self._seen_alerts,
+            self._report_subscriptions,
+            self._reported_alerts,
+        ) = self._load_state()
 
     async def run_forever(self) -> None:
         try:
@@ -348,6 +414,10 @@ class WeatherBot:
                 InboundMessage(
                     text=str(payload.get("text") or ""),
                     sender_prefix=str(payload.get("pubkey_prefix") or "").lower(),
+                    path=str(payload.get("path") or "") or None,
+                    path_len=integer_or_none(payload.get("path_len")),
+                    path_hash_mode=integer_or_none(payload.get("path_hash_mode")),
+                    received_at=datetime.now(tz=ZoneInfo("UTC")),
                 ),
             )
 
@@ -358,6 +428,10 @@ class WeatherBot:
                 InboundMessage(
                     text=str(payload.get("text") or ""),
                     channel_index=int(payload.get("channel_idx", -1)),
+                    path=str(payload.get("path") or "") or None,
+                    path_len=integer_or_none(payload.get("path_len")),
+                    path_hash_mode=integer_or_none(payload.get("path_hash_mode")),
+                    received_at=datetime.now(tz=ZoneInfo("UTC")),
                 ),
             )
 
@@ -378,6 +452,14 @@ class WeatherBot:
             ),
             mesh.subscribe(EventType.MESSAGES_WAITING, drain_waiting),
         ]
+        if self.config.test_channel_index != self.config.weather_channel_index:
+            subscriptions.append(
+                mesh.subscribe(
+                    EventType.CHANNEL_MSG_RECV,
+                    handle_channel,
+                    attribute_filters={"channel_idx": self.config.test_channel_index},
+                )
+            )
         alert_task: Optional[asyncio.Task[Any]] = None
         try:
             await self._prepare_mesh(mesh)
@@ -426,6 +508,19 @@ class WeatherBot:
                 raise MeshError(
                     f"channel {self.config.weather_channel_index} is "
                     f"{actual or 'unconfigured'!r}, not {expected!r}"
+                )
+
+            test_channel = self._require_event(
+                await mesh.commands.get_channel(self.config.test_channel_index),
+                EventType.CHANNEL_INFO,
+                "reading #test",
+            )
+            actual_test = str(test_channel.payload.get("channel_name") or "").lstrip("#")
+            expected_test = self.config.test_channel_name.lstrip("#")
+            if actual_test.casefold() != expected_test.casefold():
+                raise MeshError(
+                    f"channel {self.config.test_channel_index} is "
+                    f"{actual_test or 'unconfigured'!r}, not {expected_test!r}"
                 )
 
             await self._refresh_contacts_unlocked(mesh)
@@ -483,11 +578,97 @@ class WeatherBot:
         return expiry is not None and expiry > time.monotonic()
 
     async def handle_message(self, mesh: Any, message: InboundMessage) -> bool:
+        if message.is_channel and message.channel_index not in (
+            self.config.weather_channel_index,
+            self.config.test_channel_index,
+        ):
+            return False
+        command = command_text(message.text, message.is_channel)
+        ping_match = PING_COMMAND.fullmatch(command)
+        if ping_match:
+            if message.is_channel and message.channel_index != self.config.test_channel_index:
+                return False
+            response: str | dict[str, Any] = (
+                ping_response_data(message)
+                if ping_match.group(1)
+                else format_ping_response(message)
+            )
+            await self._reply(mesh, message, response)
+            return True
+
         if message.is_channel and message.channel_index != self.config.weather_channel_index:
             return False
-        zip_code = parse_wx_command(message.text, channel_message=message.is_channel)
-        if zip_code is None:
+        help_match = WX_HELP_COMMAND.fullmatch(command)
+        if help_match:
+            response: str | dict[str, Any] = (
+                help_response_data() if help_match.group(1) else HELP_TEXT
+            )
+            await self._reply(mesh, message, response)
+            return True
+
+        version_match = WX_VERSION_COMMAND.fullmatch(command)
+        if version_match:
+            version = git_commit()
+            response = {"type": "version", "git_commit": version} if version_match.group(1) else f"WeatherBot version: {version}"
+            await self._reply(mesh, message, response)
+            return True
+
+        report_match = WX_REPORT_COMMAND.fullmatch(command)
+        if report_match:
+            if message.is_channel:
+                response: str | dict[str, Any] = (
+                    {
+                        "type": "error",
+                        "command": "wx report",
+                        "error": "run this command in a DM",
+                    }
+                    if report_match.group(3)
+                    else "Please run wx report ZIPCODE or wx report stop in a DM."
+                )
+                await self._reply(mesh, message, response)
+                return True
+            if not message.sender_prefix:
+                raise MeshError("a queued DM did not include its sender key prefix")
+            requested = report_match.group(1).casefold()
+            wants_json = bool(report_match.group(3))
+            prefix = message.sender_prefix[:12].lower()
+            if requested == "stop":
+                removed = self._report_subscriptions.pop(prefix, [])
+                self._reported_alerts.pop(prefix, None)
+                self._save_state()
+                reply: str | dict[str, Any] = (
+                    {"type": "report", "status": "stopped", "zip_codes": removed}
+                    if wants_json
+                    else (
+                        "WX reports stopped."
+                        if removed
+                        else "You do not have any active WX reports."
+                    )
+                )
+            else:
+                zip_code = normalize_zip(requested)
+                subscriptions = self._report_subscriptions.setdefault(prefix, [])
+                if zip_code not in subscriptions:
+                    subscriptions.append(zip_code)
+                    subscriptions.sort()
+                    self._save_state()
+                reply = (
+                    {
+                        "type": "report",
+                        "status": "enabled",
+                        "zip_code": zip_code,
+                        "stop_command": "wx report stop",
+                    }
+                    if wants_json
+                    else f"WX reports enabled for {zip_code}. {REPORT_STOP_TEXT}"
+                )
+            await self._reply(mesh, message, reply)
+            return True
+
+        request = parse_wx_request(command)
+        if request is None:
             return False
+        zip_code, wants_json = request
 
         request_key = self._request_key(message, zip_code)
         if request_key is not None:
@@ -506,33 +687,48 @@ class WeatherBot:
             "channel" if message.is_channel else "DM",
         )
         try:
-            report = await self.weather.weather_report(zip_code)
-        except WeatherError as exc:
-            report = f"WX {zip_code}: lookup failed: {exc}."
-
-        if message.is_channel:
-            for chunk in split_mesh_text(report):
-                await self.send_channel(mesh, chunk)
-            return True
-        if not message.sender_prefix:
-            raise MeshError("a queued DM did not include its sender key prefix")
-        for chunk in split_mesh_text(report):
-            LOG.debug(
-                "Sending DM chunk (%d bytes) to %s",
-                len(chunk.encode("utf-8")),
-                message.sender_prefix[:12],
+            report: str | dict[str, Any] = (
+                await self.weather.weather_json(zip_code)
+                if wants_json
+                else await self.weather.weather_report(zip_code)
             )
-            await self.send_dm_with_fallback(mesh, message.sender_prefix, chunk)
+        except WeatherError as exc:
+            report = (
+                {"type": "error", "command": "wx", "zip_code": zip_code, "error": str(exc)}
+                if wants_json
+                else f"WX {zip_code}: lookup failed: {exc}."
+            )
+
+        await self._reply(mesh, message, report)
         return True
 
-    async def send_channel(self, mesh: Any, text: str) -> None:
+    async def _reply(
+        self, mesh: Any, message: InboundMessage, response: str | dict[str, Any]
+    ) -> None:
+        chunks = (
+            split_mesh_json(response)
+            if isinstance(response, dict)
+            else split_mesh_text(response)
+        )
+        if message.is_channel:
+            for chunk in chunks:
+                await self.send_channel(mesh, chunk, message.channel_index)
+            return
+        if not message.sender_prefix:
+            raise MeshError("a queued DM did not include its sender key prefix")
+        for chunk in chunks:
+            LOG.debug("Sending DM chunk (%d bytes) to %s", len(chunk.encode("utf-8")), message.sender_prefix[:12])
+            await self.send_dm_with_fallback(mesh, message.sender_prefix, chunk)
+
+    async def send_channel(
+        self, mesh: Any, text: str, channel_index: Optional[int] = None
+    ) -> None:
+        channel_index = self.config.weather_channel_index if channel_index is None else channel_index
         async with self._mesh_lock:
             self._require_event(
-                await mesh.commands.send_chan_msg(
-                    self.config.weather_channel_index, text
-                ),
+                await mesh.commands.send_chan_msg(channel_index, text),
                 EventType.OK,
-                "sending to #Weather",
+                "sending channel message",
             )
 
     async def send_dm_with_fallback(
@@ -720,10 +916,13 @@ class WeatherBot:
             await asyncio.sleep(self.config.alert_poll_seconds)
 
     async def poll_alerts(self, mesh: Any) -> int:
-        if not self.config.alert_zip_codes:
+        monitored_zips = set(self.config.alert_zip_codes)
+        for zip_codes in self._report_subscriptions.values():
+            monitored_zips.update(zip_codes)
+        if not monitored_zips:
             return 0
         grouped: dict[str, tuple[dict[str, Any], list[str]]] = {}
-        for zip_code in self.config.alert_zip_codes:
+        for zip_code in sorted(monitored_zips):
             try:
                 location = await self.weather.resolve_zip(zip_code)
                 alerts = await self.weather.active_alerts(location)
@@ -739,54 +938,177 @@ class WeatherBot:
 
         sent = 0
         for key, (alert, zip_codes) in grouped.items():
-            if key in self._seen_alerts:
-                continue
-            try:
-                for chunk in split_mesh_text(format_channel_alert(alert, zip_codes)):
-                    await self.send_channel(mesh, chunk)
-            except MeshError as exc:
-                LOG.error("Could not send NWS alert: %s", exc)
-                continue
-            self._seen_alerts[key] = int(time.time())
-            self._save_seen_alerts()
-            sent += 1
-            LOG.info("Sent new NWS alert for ZIP(s) %s", ", ".join(zip_codes))
+            channel_zips = sorted(set(zip_codes) & set(self.config.alert_zip_codes))
+            if channel_zips and key not in self._seen_alerts:
+                try:
+                    for chunk in split_mesh_text(format_channel_alert(alert, channel_zips)):
+                        await self.send_channel(mesh, chunk)
+                except MeshError as exc:
+                    LOG.error("Could not send NWS alert: %s", exc)
+                else:
+                    self._seen_alerts[key] = int(time.time())
+                    self._save_state()
+                    sent += 1
+                    LOG.info("Sent new NWS alert for ZIP(s) %s", ", ".join(channel_zips))
+
+            for prefix, subscriptions in self._report_subscriptions.items():
+                matching_zips = sorted(set(zip_codes) & set(subscriptions))
+                delivered = self._reported_alerts.get(prefix, {})
+                if not matching_zips or key in delivered:
+                    continue
+                personal_alert = f"{format_channel_alert(alert, matching_zips)}\n{REPORT_STOP_TEXT}"
+                try:
+                    for chunk in split_mesh_text(personal_alert):
+                        await self.send_dm_with_fallback(mesh, prefix, chunk)
+                except MeshError as exc:
+                    LOG.error("Could not send NWS report alert to %s: %s", prefix, exc)
+                    continue
+                self._reported_alerts.setdefault(prefix, {})[key] = int(time.time())
+                self._save_state()
+                sent += 1
+                LOG.info("Sent NWS report alert to %s for ZIP(s) %s", prefix, ", ".join(matching_zips))
         return sent
 
-    def _load_seen_alerts(self) -> dict[str, int]:
+    def _load_state(self) -> tuple[dict[str, int], dict[str, list[str]], dict[str, dict[str, int]]]:
         try:
             with self.config.state_file.open("r", encoding="utf-8") as handle:
                 data = json.load(handle)
             seen = data.get("seen_alerts", {})
-            if isinstance(seen, dict):
-                return {str(key): int(value) for key, value in seen.items()}
+            seen_alerts = (
+                {str(key): int(value) for key, value in seen.items()}
+                if isinstance(seen, dict)
+                else {}
+            )
+            subscriptions: dict[str, list[str]] = {}
+            for prefix, values in (data.get("report_subscriptions") or {}).items():
+                if not isinstance(values, list):
+                    continue
+                try:
+                    subscriptions[str(prefix).lower()[:12]] = sorted(
+                        set(normalize_zip(value) for value in values)
+                    )
+                except WeatherError:
+                    continue
+            reported: dict[str, dict[str, int]] = {}
+            for prefix, values in (data.get("reported_alerts") or {}).items():
+                if isinstance(values, dict):
+                    reported[str(prefix).lower()[:12]] = {
+                        str(key): int(value) for key, value in values.items()
+                    }
+            return seen_alerts, subscriptions, reported
         except FileNotFoundError:
             pass
-        except (OSError, ValueError, TypeError) as exc:
+        except (AttributeError, OSError, ValueError, TypeError) as exc:
             LOG.warning("Ignoring unreadable alert state: %s", exc)
-        return {}
+        return {}, {}, {}
 
-    def _save_seen_alerts(self) -> None:
+    def _save_state(self) -> None:
         self._seen_alerts = dict(list(self._seen_alerts.items())[-2000:])
+        self._reported_alerts = {
+            prefix: dict(list(alerts.items())[-2000:])
+            for prefix, alerts in self._reported_alerts.items()
+        }
         path = self.config.state_file
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix(path.suffix + ".tmp")
         with temporary.open("w", encoding="utf-8") as handle:
-            json.dump({"seen_alerts": self._seen_alerts}, handle, indent=2, sort_keys=True)
+            json.dump(
+                {
+                    "seen_alerts": self._seen_alerts,
+                    "report_subscriptions": self._report_subscriptions,
+                    "reported_alerts": self._reported_alerts,
+                },
+                handle,
+                indent=2,
+                sort_keys=True,
+            )
             handle.write("\n")
         os.replace(temporary, path)
 
 
-def parse_wx_command(text: str, channel_message: bool = False) -> Optional[str]:
+def command_text(text: str, channel_message: bool = False) -> str:
+    """Remove the sender label openHop prepends to channel text."""
+    if channel_message and ": " in text:
+        return text.split(": ", 1)[1]
+    return text
+
+
+def parse_wx_request(text: str) -> Optional[tuple[str, bool]]:
     match = WX_COMMAND.fullmatch(text)
     if match:
-        return match.group(1)
-    # openHop labels channel text as "Sender: message" for companion clients.
-    if channel_message and ": " in text:
-        match = WX_COMMAND.fullmatch(text.split(": ", 1)[1])
-        if match:
-            return match.group(1)
+        return match.group(1), bool(match.group(2))
     return None
+
+
+def parse_wx_command(text: str, channel_message: bool = False) -> Optional[str]:
+    request = parse_wx_request(command_text(text, channel_message))
+    return request[0] if request else None
+
+
+def integer_or_none(value: Any) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def route_description(message: InboundMessage) -> str:
+    if message.path:
+        hash_size = (message.path_hash_mode or 0) + 1
+        if hash_size > 0 and len(message.path) % (hash_size * 2) == 0:
+            return " > ".join(
+                message.path[index : index + hash_size * 2]
+                for index in range(0, len(message.path), hash_size * 2)
+            )
+        return message.path
+    if message.path_len is not None and message.path_len >= 0 and message.path_len != 255:
+        return f"{message.path_len} hops"
+    return "unavailable"
+
+
+def ping_response_data(message: InboundMessage) -> dict[str, Any]:
+    received = message.received_at or datetime.now(tz=ZoneInfo("UTC"))
+    return {
+        "type": "pong",
+        "received_at": received.astimezone(ZoneInfo("UTC")).isoformat(),
+        "path": route_description(message),
+    }
+
+
+def format_ping_response(message: InboundMessage) -> str:
+    data = ping_response_data(message)
+    return f"pong — received {data['received_at']}\npath: {data['path']}"
+
+
+def help_response_data() -> dict[str, Any]:
+    return {
+        "type": "help",
+        "service": "Companion",
+        "attribution": "Gulf Coast Mesh boat, Designed by ScarlettOSA",
+        "commands": [
+            "wx ZIPCODE",
+            "wx report ZIPCODE",
+            "wx report stop",
+            "wx version",
+            "ping",
+        ],
+        "json_modifier": "Append json to a command for a structured response.",
+    }
+
+
+def git_commit() -> str:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        return result.stdout.strip() or "unknown"
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
 
 
 def normalize_zip(value: str) -> str:
@@ -942,6 +1264,21 @@ def split_mesh_text(text: str, byte_limit: int = 140) -> list[str]:
     return [f"[{index}/{total}] {chunk}" for index, chunk in enumerate(chunks, 1)]
 
 
+def split_mesh_json(data: dict[str, Any], byte_limit: int = 140) -> list[str]:
+    """Encode JSON compactly and split without adding non-JSON part markers.
+
+    MeshCore messages are limited in size. Concatenating these chunks in order always
+    reconstructs the original JSON document.
+    """
+    encoded = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+    chunks: list[str] = []
+    remaining = encoded
+    while remaining:
+        piece, remaining = _cut_utf8(remaining, byte_limit)
+        chunks.append(piece)
+    return chunks or ["{}"]
+
+
 def load_config(path: Path) -> BotConfig:
     try:
         with path.open("r", encoding="utf-8") as handle:
@@ -970,6 +1307,8 @@ def load_config(path: Path) -> BotConfig:
         weather_channel_index=int(raw.get("weather_channel_index", 1)),
         weather_channel_name=str(raw.get("weather_channel_name", "Weather")).lstrip("#"),
         weather_channel_key=str(raw.get("weather_channel_key", "")),
+        test_channel_index=int(raw.get("test_channel_index", 2)),
+        test_channel_name=str(raw.get("test_channel_name", "test")).lstrip("#"),
         alert_zip_codes=list(dict.fromkeys(zip_codes)),
         alert_poll_seconds=int(raw.get("alert_poll_seconds", 60)),
         direct_retries=int(raw.get("direct_retries", 3)),
@@ -987,6 +1326,12 @@ def load_config(path: Path) -> BotConfig:
         raise SystemExit("weather_channel_index must be between 0 and 39")
     if not config.weather_channel_name:
         raise SystemExit("weather_channel_name cannot be empty")
+    if not 0 <= config.test_channel_index <= 39:
+        raise SystemExit("test_channel_index must be between 0 and 39")
+    if not config.test_channel_name:
+        raise SystemExit("test_channel_name cannot be empty")
+    if config.test_channel_index == config.weather_channel_index:
+        raise SystemExit("test_channel_index must differ from weather_channel_index")
     if not config.bot_name or len(config.bot_name.encode("utf-8")) > 31:
         raise SystemExit("bot_name must be 1-31 UTF-8 bytes")
     if config.alert_poll_seconds < 30:

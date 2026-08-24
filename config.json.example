@@ -7,6 +7,9 @@
   "weather_channel_name": "Weather",
   "weather_channel_key": "",
 
+  "test_channel_index": 2,
+  "test_channel_name": "test",
+
   "alert_zip_codes": ["60601", "63101"],
   "alert_poll_seconds": 60,
 
