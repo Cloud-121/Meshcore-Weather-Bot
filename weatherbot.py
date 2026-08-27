@@ -29,6 +29,10 @@ from meshcore import EventType, MeshCore
 
 LOG = logging.getLogger("weatherbot")
 WX_COMMAND = re.compile(r"\s*wx\s+(\d{5})(?:-\d{4})?(?:\s+(json))?\s*", re.IGNORECASE)
+WX_ALL_API_COMMAND = re.compile(
+    r"\s*wx\s+(\d{5})(?:-\d{4})?\s+json\s+all\s+api\s*", re.IGNORECASE
+)
+BOT_API_COMMAND = re.compile(r"\s*bot\s+json\s+api\s*", re.IGNORECASE)
 WX_HELP_COMMAND = re.compile(r"\s*wx\s+help(?:\s+(json))?\s*", re.IGNORECASE)
 WX_VERSION_COMMAND = re.compile(r"\s*wx\s+version(?:\s+(json))?\s*", re.IGNORECASE)
 WX_REPORT_COMMAND = re.compile(
@@ -306,6 +310,67 @@ class WeatherService:
             alert_summaries.append(summary)
         report["a"] = alert_summaries
         return report
+
+    async def weather_api_all(self, zip_code: str) -> dict[str, Any]:
+        """Return the curated data set used by the versioned mesh API."""
+        location = await self.resolve_zip(zip_code)
+        observation: dict[str, Any] = {}
+        if location.station_url:
+            try:
+                data = await self._get_json(location.station_url.rstrip("/") + "/observations/latest")
+                observation = data.get("properties") or {}
+            except WeatherError:
+                pass
+
+        periods: list[dict[str, Any]] = []
+        if location.hourly_url:
+            try:
+                hourly = await self._get_json(location.hourly_url)
+                periods = [item for item in ((hourly.get("properties") or {}).get("periods") or []) if isinstance(item, dict)][:5]
+            except WeatherError:
+                pass
+        alerts = await self.active_alerts(location)
+
+        current: dict[str, Any] = {}
+        if observation:
+            temperature = quantity(observation.get("temperature"))
+            if temperature is not None:
+                current["t"] = round(to_fahrenheit(temperature, unit_code(observation.get("temperature"))))
+            description = clean_text(str(observation.get("textDescription") or ""))
+            if description:
+                current["c"] = description
+            humidity = quantity(observation.get("relativeHumidity"))
+            if humidity is not None:
+                current["h"] = round(humidity)
+            wind = quantity(observation.get("windSpeed"))
+            if wind is not None:
+                mph = to_mph(wind, unit_code(observation.get("windSpeed")))
+                current["w"] = "calm" if mph < 1 else f"{degrees_to_compass(quantity(observation.get('windDirection')))} {round(mph)}"
+        elif periods:
+            current = api_period_data(periods[0], 0)
+            current.pop("m", None)
+
+        now = datetime.now(tz=ZoneInfo("UTC"))
+        hourly_data = [api_period_data(period, api_minutes_from(now, period.get("startTime"))) for period in periods]
+        alert_data = []
+        for alert in alerts:
+            properties = alert.get("properties") or {}
+            item = [
+                clean_text(str(properties.get("event") or "Weather Alert")),
+                clean_text(str(properties.get("severity") or "Unknown")),
+            ]
+            ends = format_alert_time(properties.get("ends") or properties.get("expires"), str(properties.get("timeZone") or ""))
+            if ends:
+                item.append(ends)
+            alert_data.append(item)
+        return {
+            "k": "w",
+            "z": location.zip_code,
+            "g": int(now.timestamp()),
+            "n": current,
+            "h": hourly_data,
+            "a": alert_data,
+        }
 
     async def _current_conditions(self, location: Location) -> list[str]:
         if location.station_url:
@@ -774,6 +839,10 @@ class WeatherBot:
 
         if message.is_channel and message.channel_index != self.config.weather_channel_index:
             return False
+        bot_api_match = BOT_API_COMMAND.fullmatch(command)
+        if bot_api_match:
+            await self._reply_api(mesh, message, api_discovery_parts())
+            return True
         help_match = WX_HELP_COMMAND.fullmatch(command)
         if help_match:
             response: str | dict[str, Any] = (
@@ -841,6 +910,25 @@ class WeatherBot:
             await self._reply(mesh, message, reply)
             return True
 
+        all_api_match = WX_ALL_API_COMMAND.fullmatch(command)
+        if all_api_match:
+            zip_code = all_api_match.group(1)
+            request_key = self._request_key(message)
+            if request_key is not None:
+                if self._is_seen(request_key):
+                    LOG.info("Ignoring duplicate API weather request for %s", zip_code)
+                    return True
+                self._note_seen(request_key)
+            try:
+                await self._reply_api(mesh, message, api_weather_parts(await self.weather.weather_api_all(zip_code)))
+            except WeatherError as exc:
+                await self._reply_api(
+                    mesh,
+                    message,
+                    [{"k": "e", "c": 1, "z": zip_code, "e": api_error_code(exc)}],
+                )
+            return True
+
         request = parse_wx_request(command)
         if request is None:
             return False
@@ -903,6 +991,25 @@ class WeatherBot:
             raise MeshError("a queued DM did not include its sender key prefix")
         for chunk in chunks:
             LOG.debug("Sending DM chunk (%d bytes) to %s", len(chunk.encode("utf-8")), message.sender_prefix[:12])
+            await self.send_dm_with_fallback(mesh, message.sender_prefix, chunk)
+
+    async def _reply_api(
+        self, mesh: Any, message: InboundMessage, parts: list[dict[str, Any]]
+    ) -> None:
+        """Send API v1 fragments, each of which is a complete JSON document."""
+        flood_warning = False
+        if not message.is_channel:
+            if not message.sender_prefix:
+                raise MeshError("a queued DM did not include its sender key prefix")
+            flood_warning = not await self._has_contact(mesh, message.sender_prefix)
+        chunks = api_mesh_envelopes(parts, flood_warning=flood_warning)
+        if message.is_channel:
+            for chunk in chunks:
+                await self.send_channel(mesh, chunk, message.channel_index)
+            return
+        if not message.sender_prefix:
+            raise MeshError("a queued DM did not include its sender key prefix")
+        for chunk in chunks:
             await self.send_dm_with_fallback(mesh, message.sender_prefix, chunk)
 
     async def send_channel(
@@ -1366,6 +1473,191 @@ def decode_channel_key(encoded: str) -> bytes:
 
 def clean_text(value: str) -> str:
     return " ".join(value.replace("\x00", " ").split())
+
+
+def api_clip(value: Any, byte_limit: int) -> tuple[str, bool]:
+    """Return a UTF-8-safe compact string and whether information was removed."""
+    text = clean_text(str(value))
+    if len(text.encode("utf-8")) <= byte_limit:
+        return text, False
+    clipped = text.encode("utf-8")[:byte_limit].decode("utf-8", errors="ignore").rstrip()
+    return clipped, True
+
+
+def api_minutes_from(now: datetime, start_time: Any) -> int:
+    try:
+        start = datetime.fromisoformat(str(start_time).replace("Z", "+00:00"))
+        if start.tzinfo is None:
+            return 0
+        return max(0, round((start.astimezone(ZoneInfo("UTC")) - now).total_seconds() / 60))
+    except (TypeError, ValueError):
+        return 0
+
+
+def api_period_data(period: dict[str, Any], minutes: int) -> dict[str, Any]:
+    """Normalize one NWS hourly period into the API's named compact fields."""
+    result: dict[str, Any] = {"m": minutes}
+    temperature = period.get("temperature")
+    if temperature is not None:
+        value = float(temperature)
+        if str(period.get("temperatureUnit") or "F").upper() == "C":
+            value = value * 9 / 5 + 32
+        result["t"] = round(value)
+    forecast = clean_text(str(period.get("shortForecast") or ""))
+    if forecast:
+        result["c"] = forecast
+    wind = clean_text(f"{period.get('windDirection') or ''} {period.get('windSpeed') or ''}")
+    if wind:
+        result["w"] = wind
+    probability = quantity(period.get("probabilityOfPrecipitation"))
+    if probability is not None:
+        result["p"] = round(probability)
+    return result
+
+
+def api_weather_code(value: Any) -> int:
+    text = clean_text(str(value)).casefold()
+    if any(word in text for word in ("thunder", "t-storm")):
+        return 6
+    if any(word in text for word in ("snow", "sleet", "blizzard", "ice")):
+        return 7
+    if any(word in text for word in ("rain", "shower", "drizzle")):
+        return 5
+    if any(word in text for word in ("fog", "mist", "haze", "smoke")):
+        return 8
+    if "wind" in text:
+        return 9
+    if any(word in text for word in ("clear", "sunny")):
+        return 1
+    if "partly" in text:
+        return 2
+    if "mostly" in text:
+        return 3
+    if any(word in text for word in ("cloud", "overcast")):
+        return 4
+    return 0
+
+
+def api_direction_degrees(value: Any) -> Optional[int]:
+    text = clean_text(str(value)).upper()
+    compass = {"N": 0, "NE": 45, "E": 90, "SE": 135, "S": 180, "SW": 225, "W": 270, "NW": 315}
+    for token in text.replace("-", " ").split():
+        if token in compass:
+            return compass[token]
+        try:
+            return round(float(token)) % 360
+        except ValueError:
+            pass
+    return None
+
+
+def api_wind_values(value: Any) -> tuple[Optional[int], Optional[int]]:
+    direction = api_direction_degrees(value)
+    match = re.search(r"(-?\d+(?:\.\d+)?)", clean_text(str(value)))
+    speed = round(float(match.group(1))) if match else None
+    return direction, speed
+
+
+def api_alert_code(value: Any) -> int:
+    text = clean_text(str(value)).casefold()
+    for code, words in ((1, ("tornado",)), (2, ("thunder", "lightning")), (3, ("flood",)), (4, ("wind",)), (5, ("winter", "snow", "ice", "freeze")), (6, ("heat",)), (7, ("hurricane", "tropical",)), (8, ("fire", "red flag")), (9, ("air quality",))):
+        if any(word in text for word in words):
+            return code
+    return 0
+
+
+def api_severity_code(value: Any) -> int:
+    return {"minor": 1, "moderate": 2, "severe": 3, "extreme": 4}.get(clean_text(str(value)).casefold(), 0)
+
+
+def api_error_code(error: WeatherError) -> int:
+    text = str(error).casefold()
+    if "zip code was not found" in text:
+        return 1
+    if "unavailable" in text:
+        return 2
+    if "invalid" in text:
+        return 3
+    return 0
+
+
+def _compact_api_object(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Apply deterministic field caps needed to fit a three-message mesh reply."""
+    clipped = False
+    result = dict(data)
+    current = dict(result.get("n") or {})
+    wind_direction, wind_speed = api_wind_values(current.get("w"))
+    result["n"] = [
+        current.get("t"), api_weather_code(current.get("c")), current.get("h"), wind_direction, wind_speed
+    ]
+    hourly = []
+    for original in result.get("h") or []:
+        item = dict(original)
+        direction, speed = api_wind_values(item.get("w"))
+        hourly.append([item.get("m", 0), item.get("t"), api_weather_code(item.get("c")), direction, speed, item.get("p")])
+    result["h"] = hourly[:5]
+    if len(hourly) > 5:
+        clipped = True
+    alerts = []
+    for original in (result.get("a") or [])[:5]:
+        alerts.append([api_alert_code(original[0] if original else ""), api_severity_code(original[1] if len(original) > 1 else "")])
+    if len(result.get("a") or []) > 5:
+        clipped = True
+    result["a"] = alerts
+    return result, clipped
+
+
+def api_weather_parts(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Partition the complete weather response into mergeable API fragment data."""
+    compact, clipped = _compact_api_object(data)
+    hourly = compact.pop("h")
+    alerts = compact.pop("a")
+    parts = [compact]
+    hourly_rows = hourly
+    if hourly_rows:
+        parts.append({"h": hourly_rows[:3]})
+        final: dict[str, Any] = {"h": hourly_rows[3:]}
+        if alerts:
+            final["a"] = alerts
+        if clipped:
+            final["x"] = True
+        if final["h"] or "a" in final or clipped:
+            parts.append(final)
+    else:
+        final = {"a": alerts}
+        if clipped:
+            final["x"] = True
+        parts.append(final)
+    return parts
+
+
+def api_discovery_parts() -> list[dict[str, Any]]:
+    return [{
+        "k": "b",
+        "cmd": 3,
+        "lim": [140, 3],
+        "u": ["F", "mph", "%"],
+    }]
+
+
+def api_mesh_envelopes(
+    parts: list[dict[str, Any]], flood_warning: bool = False, byte_limit: int = 140
+) -> list[str]:
+    """Encode a v1 API reply as independently parseable, mergeable JSON objects."""
+    if not 1 <= len(parts) <= 3:
+        raise MeshError("API reply exceeds the three-message mesh limit")
+    response_id = hashlib.sha256(f"{time.time_ns()}:{parts}".encode()).hexdigest()[:6]
+    total = len(parts)
+    encoded = []
+    for number, data in enumerate(parts, 1):
+        envelope: dict[str, Any] = {"v": 1, "i": response_id, "p": number, "n": total, "d": data}
+        if flood_warning:
+            envelope["w"] = 1
+        item = json.dumps(envelope, separators=(",", ":"), ensure_ascii=False)
+        if len(item.encode("utf-8")) > byte_limit:
+            raise MeshError("API reply cannot fit in the mesh message limit")
+        encoded.append(item)
+    return encoded
 
 
 def clean_lines(text: str) -> str:

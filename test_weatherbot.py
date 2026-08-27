@@ -83,6 +83,23 @@ class FakeWeatherService(weatherbot.WeatherService):
                     "windDirection": {"value": 225},
                 }
             }
+        if url.endswith("/grid/hourly"):
+            return {
+                "properties": {
+                    "periods": [
+                        {
+                            "startTime": f"2026-08-20T{hour:02d}:00:00-05:00",
+                            "temperature": 68 + index,
+                            "temperatureUnit": "F",
+                            "shortForecast": "Partly Cloudy",
+                            "windDirection": "SW",
+                            "windSpeed": "10 mph",
+                            "probabilityOfPrecipitation": {"value": 10},
+                        }
+                        for index, hour in enumerate(range(12, 17))
+                    ]
+                }
+            }
         if "/alerts/active" in url:
             self.alert_params = params
             return {
@@ -130,6 +147,15 @@ class WeatherFormattingTests(unittest.IsolatedAsyncioTestCase):
                 "a": [["Heat Advisory", "Moderate", "Aug 20 8:00 PM CDT"]],
             },
         )
+
+    async def test_weather_api_all_has_five_hourly_periods(self):
+        service = FakeWeatherService()
+        report = await service.weather_api_all("60601")
+        await service.close()
+        self.assertEqual(report["k"], "w")
+        self.assertEqual(len(report["h"]), 5)
+        self.assertEqual(report["h"][0]["t"], 68)
+        self.assertEqual(report["a"][0][:2], ["Heat Advisory", "Moderate"])
 
     async def test_report_lines_fit_mesh_limit(self):
         service = FakeWeatherService()
@@ -502,6 +528,14 @@ class FakeBriefWeather:
     async def weather_report(self, zip_code):
         return f"WX {zip_code}: Clear, 72F. No active NWS alerts."
 
+    async def weather_api_all(self, zip_code):
+        return {
+            "k": "w", "z": zip_code, "g": 1780000000,
+            "n": {"t": 72, "c": "Clear", "h": 50, "w": "SW 10 mph"},
+            "h": [{"m": hour * 60, "t": 72, "c": "Clear", "w": "SW 10 mph", "p": 0} for hour in range(5)],
+            "a": [],
+        }
+
 
 class FakeQueuedMessageCommands:
     def __init__(self, events):
@@ -652,6 +686,23 @@ class MeshAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(commands.channel_messages[0][0], 1)
         self.assertIn("WX 60601", commands.channel_messages[0][1])
 
+    async def test_api_weather_request_sends_three_machine_json_messages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot = weatherbot.WeatherBot(
+                make_config(Path(directory) / "state.json"), weather=FakeBriefWeather()
+            )
+            commands = FakeSetupCommands()
+            mesh = FakeMesh(commands)
+            self.assertTrue(
+                await bot.handle_message(
+                    mesh, weatherbot.InboundMessage("wx 60601 json all api", channel_index=1)
+                )
+            )
+        self.assertEqual(len(commands.channel_messages), 3)
+        envelopes = [json.loads(text) for _index, text in commands.channel_messages]
+        self.assertTrue(all(envelope["d"].get("k") != "wx" for envelope in envelopes))
+        self.assertTrue(all(len(text.encode("utf-8")) <= 140 for _index, text in commands.channel_messages))
+
 
 class FakeAlertWeather:
     async def resolve_zip(self, zip_code):
@@ -789,6 +840,39 @@ class CommandFeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(weatherbot.parse_wx_request("wx 70818 json"), ("70818", True))
         self.assertEqual(weatherbot.help_response_data()["type"], "help")
         self.assertRegex(weatherbot.git_commit(), r"^[0-9a-f]{40}$|^unknown$")
+
+    async def test_api_fragments_are_valid_json_and_fit_mesh_limit(self):
+        payload = {
+            "k": "w",
+            "z": "60601",
+            "g": 1780000000,
+            "n": {"t": 68, "c": "Partly Cloudy", "h": 50, "w": "SW 10 mph"},
+            "h": [
+                {"m": hour * 60, "t": 68, "c": "Partly Cloudy", "w": "SW 10 mph", "p": 10}
+                for hour in range(5)
+            ],
+            "a": [["Heat Advisory", "Moderate", "long end time"]],
+        }
+        parts = weatherbot.api_weather_parts(payload)
+        messages = weatherbot.api_mesh_envelopes(parts)
+        self.assertEqual(len(messages), 3)
+        envelopes = [json.loads(message) for message in messages]
+        self.assertTrue(all(len(message.encode("utf-8")) <= 140 for message in messages))
+        self.assertTrue(all(envelope["v"] == 1 for envelope in envelopes))
+        self.assertEqual([envelope["p"] for envelope in envelopes], [1, 2, 3])
+        merged = {}
+        for envelope in envelopes:
+            for key, value in envelope["d"].items():
+                if key == "h":
+                    merged.setdefault("h", []).extend(value)
+                else:
+                    merged[key] = value
+        self.assertEqual(len(merged["h"]), 5)
+        self.assertEqual(merged["a"], [[6, 2]])
+
+    async def test_api_command_parsers(self):
+        self.assertTrue(weatherbot.BOT_API_COMMAND.fullmatch("bot json api"))
+        self.assertEqual(weatherbot.WX_ALL_API_COMMAND.fullmatch("wx 70818 JSON ALL API").group(1), "70818")
 
 
 if __name__ == "__main__":
