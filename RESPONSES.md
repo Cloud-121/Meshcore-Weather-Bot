@@ -7,9 +7,11 @@ Examples use placeholder values in angle brackets. Lines shown together are sent
 ```text
 ☀️ <City>, <ST> <ZIPCODE>
 🌡️ <temperature>°F · <conditions>
-💧 <humidity>% · 💨 <direction> <speed> mph
+☀️ Heat index <heat index>°F · 💧 <humidity>% · 💨 <direction> <speed> mph
 ✅ No active NWS alerts
 ```
+
+The heat-index portion is present only when NWS supplies it for the latest observation.
 
 When the latest observation is unavailable, the weather section can instead be:
 
@@ -131,12 +133,16 @@ The weather JSON uses short keys to keep mesh messages small:
   "t": 72,
   "c": "<conditions>",
   "h": 50,
+  "i": 77,
   "w": "<direction> <speed> mph",
   "a": [["<alert event>", "<severity>", "<end time>"]]
 }
 ```
 
-`z` is ZIP code, `l` is location, `t` is temperature in °F, `c` is conditions, `h` is humidity percent, `w` is wind, and `a` is alerts. Each alert contains event, severity, and—when available—its end time. Missing weather fields are omitted; no active alerts are `"a":[]`.
+`z` is ZIP code, `l` is location, `t` is temperature in °F, `c` is conditions,
+`h` is humidity percent, `i` is heat index in °F, `w` is wind, and `a` is alerts.
+Each alert contains event, severity, and—when available—its end time. Missing weather
+fields are omitted; no active alerts are `"a":[]`.
 
 ### `wx help json`
 

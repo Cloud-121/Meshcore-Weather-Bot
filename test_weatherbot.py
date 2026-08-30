@@ -79,6 +79,7 @@ class FakeWeatherService(weatherbot.WeatherService):
                     "temperature": {"value": 20, "unitCode": "wmoUnit:degC"},
                     "textDescription": "Partly Cloudy",
                     "relativeHumidity": {"value": 50},
+                    "heatIndex": {"value": 25, "unitCode": "wmoUnit:degC"},
                     "windSpeed": {"value": 16.0934, "unitCode": "wmoUnit:km_h-1"},
                     "windDirection": {"value": 225},
                 }
@@ -126,6 +127,7 @@ class WeatherFormattingTests(unittest.IsolatedAsyncioTestCase):
         await service.close()
         self.assertIn("☀️ Chicago, IL 60601", report)
         self.assertIn("68°F", report)
+        self.assertIn("☀️ Heat index 77°F", report)
         self.assertIn("💧 50%", report)
         self.assertIn("💨 SW 10 mph", report)
         self.assertIn("⚠️ Heat Advisory", report)
@@ -143,6 +145,7 @@ class WeatherFormattingTests(unittest.IsolatedAsyncioTestCase):
                 "t": 68,
                 "c": "Partly Cloudy",
                 "h": 50,
+                "i": 77,
                 "w": "SW 10 mph",
                 "a": [["Heat Advisory", "Moderate", "Aug 20 8:00 PM CDT"]],
             },
@@ -155,6 +158,7 @@ class WeatherFormattingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report["k"], "w")
         self.assertEqual(len(report["h"]), 5)
         self.assertEqual(report["h"][0]["t"], 68)
+        self.assertEqual(report["n"]["i"], 77)
         self.assertEqual(report["a"][0][:2], ["Heat Advisory", "Moderate"])
 
     async def test_report_lines_fit_mesh_limit(self):
@@ -846,7 +850,7 @@ class CommandFeatureTests(unittest.IsolatedAsyncioTestCase):
             "k": "w",
             "z": "60601",
             "g": 1780000000,
-            "n": {"t": 68, "c": "Partly Cloudy", "h": 50, "w": "SW 10 mph"},
+            "n": {"t": 68, "c": "Partly Cloudy", "h": 50, "w": "SW 10 mph", "i": 77},
             "h": [
                 {"m": hour * 60, "t": 68, "c": "Partly Cloudy", "w": "SW 10 mph", "p": 10}
                 for hour in range(5)
@@ -869,6 +873,7 @@ class CommandFeatureTests(unittest.IsolatedAsyncioTestCase):
                     merged[key] = value
         self.assertEqual(len(merged["h"]), 5)
         self.assertEqual(merged["a"], [[6, 2]])
+        self.assertEqual(merged["n"], [68, 2, 50, 225, 10, 77])
 
     async def test_api_command_parsers(self):
         self.assertTrue(weatherbot.BOT_API_COMMAND.fullmatch("bot json api"))

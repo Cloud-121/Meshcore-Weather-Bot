@@ -12,6 +12,9 @@ reports the Git commit currently running. Append `json` to any `wx` command (for
 example, `wx 70818 json` or `wx help json`) to receive a compact structured JSON
 response instead of the normal text reply.
 
+Current observations include the NWS heat index when available. The text response
+labels it `Heat index`; the compact `wx ZIPCODE json` response uses the `i` key.
+
 For app integrations, see [the versioned mesh JSON API](JSON_API.md). It uses
 `bot json api` for discovery and `wx ZIPCODE json all api` for compact current,
 alert, and five-hour forecast data; existing `json` commands remain unchanged.

@@ -264,6 +264,9 @@ class WeatherService:
                 report["t"] = round(
                     to_fahrenheit(temperature, unit_code(conditions.get("temperature")))
                 )
+            heat_index = observation_heat_index(conditions)
+            if heat_index is not None:
+                report["i"] = round(heat_index)
             description = clean_text(str(conditions.get("textDescription") or ""))
             if description:
                 report["c"] = description
@@ -336,6 +339,9 @@ class WeatherService:
             temperature = quantity(observation.get("temperature"))
             if temperature is not None:
                 current["t"] = round(to_fahrenheit(temperature, unit_code(observation.get("temperature"))))
+            heat_index = observation_heat_index(observation)
+            if heat_index is not None:
+                current["i"] = round(heat_index)
             description = clean_text(str(observation.get("textDescription") or ""))
             if description:
                 current["c"] = description
@@ -398,6 +404,7 @@ class WeatherService:
                     lines.append(f"🌡️ {temperature_line}")
 
                 humidity = quantity(properties.get("relativeHumidity"))
+                heat_index = observation_heat_index(properties)
                 wind_parts: list[str] = []
                 wind = quantity(properties.get("windSpeed"))
                 if wind is not None:
@@ -413,6 +420,8 @@ class WeatherService:
                         )
                         wind_parts.append(f"{compass} {round(mph)} mph")
                 stats: list[str] = []
+                if heat_index is not None:
+                    stats.append(f"☀️ Heat index {round(heat_index)}°F")
                 if humidity is not None:
                     stats.append(f"💧 {round(humidity)}%")
                 if wind_parts:
@@ -1588,7 +1597,12 @@ def _compact_api_object(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     current = dict(result.get("n") or {})
     wind_direction, wind_speed = api_wind_values(current.get("w"))
     result["n"] = [
-        current.get("t"), api_weather_code(current.get("c")), current.get("h"), wind_direction, wind_speed
+        current.get("t"),
+        api_weather_code(current.get("c")),
+        current.get("h"),
+        wind_direction,
+        wind_speed,
+        current.get("i"),
     ]
     hourly = []
     for original in result.get("h") or []:
@@ -1680,6 +1694,15 @@ def unit_code(value: Any) -> str:
 
 def to_fahrenheit(value: float, unit: str) -> float:
     return value * 9 / 5 + 32 if "degC" in unit else value
+
+
+def observation_heat_index(observation: dict[str, Any]) -> Optional[float]:
+    """Return the NWS-provided heat index normalized to Fahrenheit."""
+    heat_index = observation.get("heatIndex")
+    value = quantity(heat_index)
+    if value is None:
+        return None
+    return to_fahrenheit(value, unit_code(heat_index))
 
 
 def to_mph(value: float, unit: str) -> float:

@@ -57,7 +57,7 @@ After merging, a normal `wx ZIPCODE json all api` response has this shape:
   "k":"w",
   "z":"60601",
   "g":1780000000,
-  "n":[68,2,50,225,10],
+  "n":[68,2,50,225,10,77],
   "h":[[0,68,2,225,10,10],[60,69,1,225,9,0]],
   "a":[[6,2]],
   "x":true
@@ -66,7 +66,7 @@ After merging, a normal `wx ZIPCODE json all api` response has this shape:
 
 - `z`: ZIP
 - `g`: generation time as Unix seconds (UTC)
-- `n`: current row in `[temperature_F, weather_code, humidity_percent, wind_direction_degrees, wind_mph]` order
+- `n`: current row in `[temperature_F, weather_code, humidity_percent, wind_direction_degrees, wind_mph, heat_index_F]` order. Heat index is `null` when NWS does not report one.
 - `h`: hourly rows in `[minutes_after_g, temperature_F, weather_code, wind_direction_degrees, wind_mph, precipitation_percent]` order. The bot returns no more than the next five rows. Optional source values are `null`.
 - `a`: alert rows in `[alert_code, severity_code]` order; an empty array means no active alerts
 - `x`: present and `true` only when more than five alerts were available
