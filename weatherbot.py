@@ -25,6 +25,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 import api_v2
+from radar import RadarError, RadarService, parse_radar_request
 from meshcore import EventType, MeshCore
 
 
@@ -297,11 +298,16 @@ class WeatherService:
 
 
 class WeatherBot:
-    def __init__(self, config: BotConfig, weather: Optional[WeatherService] = None) -> None:
+    def __init__(self, config: BotConfig, weather: Optional[WeatherService] = None,
+                 radar: Optional[RadarService] = None) -> None:
         self.config = config
         self._owns_weather = weather is None
         self.weather = weather or WeatherService(
             config.noaa_user_agent, timeout=config.http_timeout_seconds
+        )
+        self._owns_radar = radar is None
+        self.radar = radar or RadarService(
+            config.noaa_user_agent, timeout=max(30.0, config.http_timeout_seconds)
         )
         self._advertised = False
         self._contacts: dict[str, dict[str, Any]] = {}
@@ -352,6 +358,8 @@ class WeatherBot:
         finally:
             if self._owns_weather:
                 await self.weather.close()
+            if self._owns_radar:
+                await self.radar.close()
 
     async def _serve_connection(self, mesh: Any) -> None:
         disconnected = asyncio.Event()
@@ -673,7 +681,7 @@ class WeatherBot:
                     return False
                 if re.fullmatch(r"bot|wx\s+help", command, re.IGNORECASE):
                     await self._reply_v2(mesh, message, {
-                        "type": "discovery", "cmd": 127,
+                        "type": "discovery", "cmd": 255,
                         "lim": [140, api_v2.MAX_PARTS], "u": ["F", "mph", "%"],
                     })
                     return True
@@ -691,6 +699,21 @@ class WeatherBot:
                     except WeatherError as exc:
                         data = {"type": "error", "command": "wx", "zip_code": match.group(1),
                                 "error": api_error_code(exc)}
+                    await self._reply_v2(mesh, message, data)
+                    return True
+                if re.match(r"wx\s+radar(?:\s|$)", command, re.IGNORECASE):
+                    try:
+                        radar_request = parse_radar_request(command)
+                        if radar_request is None:
+                            raise RadarError("invalid radar request", 5)
+                        key = self._request_key(message)
+                        if key is not None:
+                            if self._is_seen(key):
+                                return True
+                            self._note_seen(key)
+                        data = await self.radar.snapshot(*radar_request)
+                    except RadarError as exc:
+                        data = {"type": "error", "command": "radar", "error": exc.code}
                     await self._reply_v2(mesh, message, data)
                     return True
                 if not re.fullmatch(r"wx\s+(?:\d{5}(?:-\d{4})?|version|report\s+(?:\d{5}(?:-\d{4})?|stop))", command, re.IGNORECASE):

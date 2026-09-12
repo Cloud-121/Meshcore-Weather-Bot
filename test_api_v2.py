@@ -9,6 +9,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import api_v2
+import radar
+import radar_codec
 import weatherbot
 from test_weatherbot import FakeBriefWeather, FakeMesh, FakeSetupCommands, make_config
 
@@ -18,6 +20,20 @@ def sample():
             "n": [68, 2, 50, 225, 10, 77],
             "h": [[i * 60, 68 + i, 2, 225, 10, 10] for i in range(5)],
             "a": [[6, 2]]}
+
+
+def radar_sample(width=32, forecast=False):
+    return {
+        "k": "r", "lat": 30.4515, "lon": -91.1871, "o": 3 if forecast else 0,
+        "v": 1780000000, "s": "forecast" if forecast else "observed", "n": width,
+        "c": [index % 8 for index in range(radar_codec.circle_cell_count(width))],
+        **({"i": 1779992800} if forecast else {}),
+    }
+
+
+class FakeRadar:
+    def __init__(self):
+        self.snapshot = AsyncMock(return_value=radar_sample())
 
 
 class CodecTests(unittest.TestCase):
@@ -102,13 +118,42 @@ class CodecTests(unittest.TestCase):
         data.update(n=[None] * 6, h=[], a=[])
         self.assertEqual(api_v2.decode(api_v2.encode(data))["data"], data)
 
+    def test_radar_round_trip_and_hard_four_message_budget(self):
+        rng = random.Random(44)
+        for forecast in (False, True):
+            data = radar_sample(forecast=forecast)
+            data["c"] = [rng.randrange(8) for _ in data["c"]]
+            messages = api_v2.encode(data, response_id=b"rad")
+            self.assertEqual(len(messages), 4)
+            self.assertTrue(all(len(message.encode()) <= 140 for message in messages))
+            self.assertEqual(api_v2.decode(list(reversed(messages)))["data"], data)
+
+    def test_radar_codec_rejects_bad_metadata_and_cells(self):
+        data = radar_sample()
+        for change in ({"o": 6}, {"lat": 91}, {"s": "radar"}, {"c": data["c"][:-1]}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                api_v2.encode({**data, **change})
+
+
+class RadarParserTests(unittest.TestCase):
+    def test_radar_request_parser(self):
+        self.assertEqual(radar.parse_radar_request("wx radar 30.4515 -91.1871 now"),
+                         (30.4515, -91.1871, 0))
+        self.assertEqual(radar.parse_radar_request("WX RADAR 30 -91 -5H"),
+                         (30.0, -91.0, -5))
+        self.assertEqual(radar.parse_radar_request("wx radar 30 -91 +5h"),
+                         (30.0, -91.0, 5))
+        self.assertIsNone(radar.parse_radar_request("wx radar 30 -91 +6h"))
+        with self.assertRaises(radar.RadarError):
+            radar.parse_radar_request("wx radar nan -91 now")
+
 
 class IntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.bot = weatherbot.WeatherBot(make_config(Path(self.directory.name) / "state.json"),
-                                         weather=FakeBriefWeather())
+                                         weather=FakeBriefWeather(), radar=FakeRadar())
         self.commands = FakeSetupCommands()
         self.mesh = FakeMesh(self.commands)
 
@@ -173,6 +218,26 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.commands.channel_messages.clear()
         await self.bot.handle_message(self.mesh, weatherbot.InboundMessage("wx report 00601 api2", channel_index=1))
         self.assertEqual(api_v2.decode([self.commands.channel_messages[0][1]])["data"]["error"], 4)
+
+    async def test_radar_request_response_and_duplicate(self):
+        message = weatherbot.InboundMessage(
+            "wx radar 30.4515 -91.1871 +3h api2", channel_index=1,
+            sender_timestamp=123,
+        )
+        await self.bot.handle_message(self.mesh, message)
+        await self.bot.handle_message(self.mesh, message)
+        texts = [text for _, text in self.commands.channel_messages]
+        self.assertLessEqual(len(texts), 4)
+        self.assertEqual(api_v2.decode(texts)["data"], radar_sample())
+        self.bot.radar.snapshot.assert_awaited_once_with(30.4515, -91.1871, 3)
+
+    async def test_invalid_radar_request_is_compact_error(self):
+        await self.bot.handle_message(
+            self.mesh,
+            weatherbot.InboundMessage("wx radar 95 -91 now api2", channel_index=1),
+        )
+        result = api_v2.decode([text for _, text in self.commands.channel_messages])
+        self.assertEqual(result["data"], {"type": "error", "command": "radar", "error": 5})
 
 
 if __name__ == "__main__":

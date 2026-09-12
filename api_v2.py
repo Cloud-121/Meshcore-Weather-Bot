@@ -9,9 +9,12 @@ import re
 import secrets
 import zlib
 
+import radar_codec
+
 PREFIX = "~W2"
 MAX_BYTES = 140
 MAX_PARTS = 16
+MAX_RADAR_PARTS = 4
 MAX_DECODED = 8192
 
 # Index order is part of the wire protocol. Never reorder these fields.
@@ -140,6 +143,8 @@ def encode(data: dict, *, flood_warning: bool = False,
     """Encode a normalized response into <=16 independently armored messages."""
     if data.get("k") == "w":
         kind, payload = 1, _weather(data)
+    elif data.get("k") == "r":
+        kind, payload = 8, radar_codec.encode(data)
     else:
         kind = next((k for k, (name, _) in SCHEMAS.items()
                      if name == data.get("type")), None)
@@ -164,7 +169,7 @@ def encode(data: dict, *, flood_warning: bool = False,
     # 102 raw bytes -> 136 Base64 characters + 3 marker bytes = 139.
     capacity = 98 if len(payload) <= 98 else 96
     total = max(1, (len(payload) + capacity - 1) // capacity)
-    if total > MAX_PARTS:
+    if total > MAX_PARTS or kind == 8 and total > MAX_RADAR_PARTS:
         raise ValueError("response exceeds fragment limit")
     messages = []
     for part in range(total):
@@ -203,6 +208,8 @@ def decode(messages: list[str]) -> dict:
             part, total, payload = raw[4], raw[5], raw[6:]
             if not 2 <= total <= MAX_PARTS or part >= total:
                 raise ValueError("invalid fragment index/count")
+            if flags & 15 == 8 and total > MAX_RADAR_PARTS:
+                raise ValueError("radar response exceeds fragment limit")
         else:
             part, total, payload = 0, 1, raw[4:]
         key = (flags, raw[1:4], total)
@@ -226,6 +233,8 @@ def decode(messages: list[str]) -> dict:
     kind = flags & 15
     if kind == 1:
         data = _read_weather(payload)
+    elif kind == 8:
+        data = radar_codec.decode(payload)
     elif kind in SCHEMAS:
         name, fields = SCHEMAS[kind]
         try:

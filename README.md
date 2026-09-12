@@ -26,6 +26,13 @@ For smaller machine replies, see [Compact API v2](API_V2.md). Send
 `bot api2` for discovery. The reference decoder is in `api_v2.py`. Normal commands
 and automatic alerts remain human-readable; existing JSON formats are preserved.
 
+API v2 also provides compact CONUS radar snapshots for map-capable clients. For
+example, `wx radar 30.4515 -91.1871 now api2` requests observed reflectivity in a
+50-mile circle, while `-5h` through `+5h` select one past observation or future
+HRRR simulated-reflectivity forecast. Radar replies are binary packed and capped at
+four MeshCore application messages; see [API_V2.md](API_V2.md) for the Flutter-facing
+grid and bit-packing contract.
+
 Use `wx report ZIPCODE` in a DM to subscribe that identity to NOAA alerts for a ZIP;
 repeat it to add more ZIPs. Every report alert is sent by DM and ends with
 `wx report stop`, which removes all of that identity's subscriptions. In `#Weather`,

@@ -38,6 +38,7 @@ normalized to the first five digits. Leading zeroes survive encoding.
 | `bot api2` | Capabilities | DM or Weather channel |
 | `wx help api2` | Same capabilities | DM or Weather channel |
 | `wx ZIPCODE all api2` | Binary current + up to five hours + coded alerts | DM or Weather channel |
+| `wx radar LAT LON TIME api2` | 50-mile circular observed/forecast reflectivity grid | DM or Weather channel |
 | `wx ZIPCODE api2` | Current summary, with location and descriptions | DM or Weather channel |
 | `wx version api2` | Git version | DM or Weather channel |
 | `ping api2` | Receipt time, route, optional distance | DM or configured test channel |
@@ -47,6 +48,47 @@ normalized to the first five digits. Leading zeroes survive encoding.
 Do not add `json`: `api2` selects the new format directly. Unsupported `api2`
 commands in DM/Weather receive error 5. Disallowed channels are ignored, including
 ping requests on Weather.
+
+Radar `TIME` is `now` or an explicitly signed whole-hour offset from `-5h` through
+`+5h`. `now` and non-positive offsets return observed MRMS reflectivity; positive
+offsets return HRRR simulated reflectivity and must be presented as a forecast.
+Each request returns one snapshot. Initial provider coverage is CONUS only.
+
+### Radar request flow
+
+The phone sends the complete command as one ordinary MeshCore text message. Latitude
+comes before longitude and both use signed decimal degrees:
+
+```text
+wx radar 30.4515 -91.1871 now api2
+wx radar 30.4515 -91.1871 -5h api2
+wx radar 30.4515 -91.1871 +5h api2
+```
+
+The request does not contain a client request ID. The phone should normally allow
+only one outstanding radar request per bot. The bot performs these steps:
+
+1. Record its UTC receipt time and validate the coordinates and hour offset.
+2. For `now` or a negative offset, select the newest MRMS observation at or before
+   the requested time. It must be within 15 minutes of that time.
+3. For a positive offset, select an available HRRR run and the forecast hour nearest
+   the requested valid time. HRRR valid times are hourly.
+4. Build a north-up 32-by-32 conceptual grid spanning 100 miles across each axis.
+5. Keep the 812 cell centers inside the 50-mile-radius circle and sample the nearest
+   NOAA reflectivity-grid point for each center.
+6. Quantize each reflectivity value to one of the eight three-bit codes below.
+7. Build the 19-byte metadata header followed by 305 packed cell bytes.
+8. Apply raw DEFLATE only if it makes the complete 324-byte payload smaller.
+9. Split the resulting bytes into at most four API v2 fragments and Base64url-armour
+   each fragment for MeshCore's text transport.
+
+The reply is therefore not a PNG, map tile, JSON document, or sequence of ASCII
+zeroes and ones. It is binary metadata and bit-packed grid values carried inside
+Base64url text. The Flutter app reassembles those bytes and draws the cells over its
+own map.
+
+The bot's 24-bit response ID is generated for the reply and is not related to the
+coordinates or requested hour. It exists only to group that reply's fragments.
 
 **Subscriptions:** acknowledgments are compact, but subsequent automatic
 notifications remain human text. V2 uses the existing subscription state; it does
@@ -94,6 +136,10 @@ most **139 ASCII bytes**, within the configured 140-byte budget.
 The encoder creates the complete payload, optionally compresses it, then splits
 it. All fragments share flags, type, ID, and total count. Fragment count is 2–16;
 single frames omit fragment metadata entirely.
+
+Type 8 radar responses are additionally limited to four fragments. This is a hard
+application-response limit; radio acknowledgments, retries, and flood fallback are
+transport activity and can result in additional RF transmissions.
 
 1. Group by bot identity, transport/channel context, and response ID.
 2. Require consistent flags and total count.
@@ -196,6 +242,206 @@ Alerts: `0` other, `1` tornado, `2` thunder/lightning, `3` flood, `4` wind,
 
 Severity: `0` unknown, `1` minor, `2` moderate, `3` severe, `4` extreme.
 
+## Type 8: circular radar grid
+
+Radar uses a fixed binary schema. Multi-byte integers are big-endian. Version 1 has
+a fixed 50-statute-mile (80,467.2 metre) radius.
+
+### Payload size
+
+The normal width is 32. Its uncompressed payload has a fixed worst-case size:
+
+```text
+metadata                 19 bytes
+812 cells x 3 bits     2,436 bits
+packed cells       ceil(2436/8) = 305 bytes
+complete payload         324 bytes
+```
+
+Four fragmented messages can carry 384 payload bytes, so the 324-byte form always
+fits even when the grid is high entropy and cannot be compressed. Clear or uniform
+weather often compresses into fewer messages. Clients must accept any count from one
+through four and must not infer grid dimensions from fragment count.
+
+Width 28 is reserved as a lower-resolution profile. It contains 616 circular cells,
+requiring 231 packed bytes and 250 total uncompressed payload bytes. The width byte
+always tells the client which profile was returned.
+
+### Metadata header
+
+| Bytes | Meaning |
+| --- | --- |
+| 0 | Source: `0` observed MRMS, `1` forecast HRRR; bits 1–7 zero |
+| 1 | Square grid width: currently `28` or `32` |
+| 2 | Requested signed hour offset as an 8-bit two's-complement integer |
+| 3–6 | Center latitude in signed degrees times 100,000 |
+| 7–10 | Center longitude in signed degrees times 100,000 |
+| 11–14 | Product valid time, unsigned Unix seconds UTC |
+| 15–18 | Forecast issue time, unsigned Unix seconds UTC; zero for observations |
+| 19–end | Three-bit reflectivity codes, packed least-significant bit first |
+
+For the decoded object, these bytes map to fields as follows:
+
+| Field | Meaning |
+| --- | --- |
+| `k` | Always `r`; identifies radar after decoding |
+| `lat`, `lon` | Actual encoded center in decimal degrees |
+| `o` | Requested whole-hour offset, `-5` through `5` |
+| `v` | Actual product valid time as Unix seconds UTC |
+| `i` | HRRR model issue time; present for forecasts only |
+| `s` | `observed` or `forecast` |
+| `n` | Conceptual square width, currently 28 or 32 |
+| `c` | Circular cell codes in wire order |
+
+Do not calculate the displayed timestamp as receipt time plus `o`. Use `v`: MRMS
+has publication latency and HRRR is restricted to hourly valid times. For forecasts,
+`i` allows the UI to show which model run generated the result.
+
+### Cell order and map placement
+
+The conceptual square is north-up. Cells are visited row-major from north to south
+and west to east, but a cell is transmitted only when its center is inside the
+circle. For zero-based `(x,y)` and width `n`, include it when:
+
+```text
+(2*x + 1 - n)^2 + (2*y + 1 - n)^2 <= n^2
+```
+
+This produces 616 values for width 28 and 812 for width 32. For each included cell,
+let `east=((x+0.5)/n*2-1)*80.4672` km and
+`north=(1-(y+0.5)/n*2)*80.4672` km. Its center is the great-circle destination from
+the encoded center with distance `hypot(east,north)` on a 6371.0088 km sphere and
+initial bearing `atan2(east,north)`. Normalize longitude to `[-180,180)`.
+
+Within a byte, the first cell starts at bit zero; values crossing a byte boundary
+continue in the next byte. Unused high bits in the final byte are zero. The receiver
+computes geographic cell centers over the 100-mile diameter from the encoded center;
+no per-cell coordinates are transmitted.
+
+The app can either render each included cell as a small polygon centered at that
+computed position or first reconstruct a square `n*n` array. When reconstructing a
+square, iterate every `(x,y)` in row-major order, apply the circle test, and consume
+one `c` value only for included cells. Values outside the circle are not present in
+the payload and should remain transparent.
+
+This distinction is important:
+
+- Outside circle: no value was transmitted; render transparent.
+- Code 0: NOAA returned a valid dry/below-threshold value.
+- Code 7: NOAA data was missing or had no coverage; render transparent or with a
+  separate unavailable-data treatment, but never as clear weather.
+
+### Three-bit packing
+
+Cell codes are appended to one continuous little-endian bit stream. For cell index
+`j`, its three bits begin at bit offset `j*3`. This is independent of byte
+boundaries. Decoder pseudocode is:
+
+```text
+bit = 0
+for every expected cell:
+    byteIndex = bit ~/ 8
+    shift = bit % 8
+    value = packed[byteIndex] >> shift
+    if shift > 5:
+        value |= packed[byteIndex + 1] << (8 - shift)
+    cells.add(value & 7)
+    bit += 3
+```
+
+For example, codes `[1,2,7]` become bytes `D1 01`. The third code crosses the byte
+boundary. Any unused high bits in the final packed byte must be zero.
+
+| Code | Composite reflectivity |
+| --- | --- |
+| 0 | Dry/below 5 dBZ |
+| 1 | 5 to below 20 dBZ |
+| 2 | 20 to below 30 dBZ |
+| 3 | 30 to below 40 dBZ |
+| 4 | 40 to below 50 dBZ |
+| 5 | 50 to below 60 dBZ |
+| 6 | 60 dBZ or greater |
+| 7 | Missing/no coverage; never render this as dry |
+
+Decoded reference object:
+
+```json
+{"k":"r","lat":30.4515,"lon":-91.1871,"o":3,"v":1780000000,
+ "i":1779992800,"s":"forecast","n":32,"c":[0,0,1,2]}
+```
+
+The sample `c` above is abbreviated. Observations omit `i`. Clients must label
+`s=forecast` as model guidance rather than observed radar. Always display or retain
+the actual valid time because source cadence and publication delay mean it can
+differ from the requested wall-clock time.
+
+### Complete transmission sequence
+
+For an uncompressible width-32 response, the four bot messages have this logical
+form. Values in angle brackets are binary before Base64url encoding:
+
+```text
+~W2<Base64url: type/flags + response ID + index 0 + count 4 + payload bytes 0..95>
+~W2<Base64url: type/flags + response ID + index 1 + count 4 + payload bytes 96..191>
+~W2<Base64url: type/flags + response ID + index 2 + count 4 + payload bytes 192..287>
+~W2<Base64url: type/flags + response ID + index 3 + count 4 + payload bytes 288..323>
+```
+
+For type 8 without compression or a contact warning, transport byte 0 is `0x48`:
+type 8 (`0x08`) plus fragmented (`0x40`). With raw DEFLATE it is `0x68`; with the
+DM contact warning it is `0x58` uncompressed or `0x78` compressed. These transport
+flags are separate from byte 0 of the reassembled radar payload.
+
+Each full fragment consists of a six-byte transport header and up to 96 payload
+bytes. Base64url expands a full 102-byte binary frame to 136 characters; adding the
+three-character `~W2` marker produces 139 ASCII bytes. The uncompressible 324-byte
+benchmark produces wire-message lengths `139, 139, 139, 59`, totaling 476 ASCII
+bytes across four MeshCore application messages.
+
+### Flutter decoding outline
+
+The Flutter client should perform transport reassembly before decoding radar:
+
+```dart
+// Outline only: keep bounded buffers and validate every field as described above.
+final encoded = message.substring(3); // Remove the case-sensitive "~W2" marker.
+final raw = base64Url.decode(base64Url.normalize(encoded));
+final transport = raw[0];
+final kind = transport & 0x0f;
+final compressed = (transport & 0x20) != 0;
+final fragmented = (transport & 0x40) != 0;
+final responseId = raw.sublist(1, 4);
+final index = fragmented ? raw[4] : 0;
+final count = fragmented ? raw[5] : 1;
+final slice = raw.sublist(fragmented ? 6 : 4);
+```
+
+Group slices by bot identity, MeshCore context, and the three response-ID bytes.
+After all indexes are present, concatenate slices in index order. If `compressed`
+is set, decode the concatenated payload once with raw DEFLATE, for example
+`ZLibDecoder(raw: true)`. Do not decompress each fragment separately.
+
+Then require `kind == 8`, read the 19-byte radar header using `ByteData` with
+`Endian.big`, calculate the expected circular cell count, verify the exact packed
+length, and unpack the three-bit values. In particular:
+
+```dart
+final view = ByteData.sublistView(payload);
+final sourceFlags = view.getUint8(0);
+final width = view.getUint8(1);
+final requestedOffset = view.getInt8(2);
+final latitude = view.getInt32(3, Endian.big) / 100000.0;
+final longitude = view.getInt32(7, Endian.big) / 100000.0;
+final validUnix = view.getUint32(11, Endian.big);
+final issuedUnix = view.getUint32(15, Endian.big);
+final packedCells = payload.sublist(19);
+```
+
+Reject reserved source flag bits, unsupported widths, offsets outside `-5..5`, bad
+coordinates, inconsistent observation/forecast issue times, an unexpected cell
+count, nonzero padding bits, or trailing bytes. Expire an incomplete response rather
+than drawing a partial radar grid.
+
 ## Types 2–7: positional payloads
 
 These are compact UTF-8 JSON **arrays**, optionally DEFLATE-compressed. Field names
@@ -219,11 +465,11 @@ part of the protocol and must not be reordered by implementations.
 ### Discovery
 
 ```json
-[127,[140,16],["F","mph","%"]]
+[255,[140,16],["F","mph","%"]]
 ```
 
 `cmd` capability bits: 0 discovery/help, 1 current summary, 2 combined weather,
-3 version, 4 ping, 5 report enable, 6 report stop. `lim` is maximum message bytes
+3 version, 4 ping, 5 report enable, 6 report stop, 7 radar. `lim` is maximum message bytes
 and maximum fragments. `u` supplies standard units. Help sends capabilities instead
 of static prose; the client provides instructions and display labels.
 
@@ -246,7 +492,7 @@ nulls can appear where legacy JSON omitted a key.
 
 ### Errors
 
-`command` is `wx`, `wx report`, or `api2`; `error` is numeric; ZIP is optional.
+`command` is `wx`, `wx report`, `radar`, or `api2`; `error` is numeric; ZIP is optional.
 The client supplies human-readable/localized explanations.
 
 | Code | Meaning |
@@ -257,6 +503,8 @@ The client supplies human-readable/localized explanations.
 | 3 | Invalid provider data or response exceeds encoding limits |
 | 4 | Subscription operation requires DM |
 | 5 | Unsupported/malformed API v2 command |
+| 6 | Radar location outside supported coverage |
+| 7 | Requested radar observation/forecast unavailable |
 
 ## Interoperability vector
 
@@ -323,10 +571,13 @@ Run `python benchmark_api_v2.py` for deterministic five-hour fixtures:
 | Five alerts | 341 / 3 | 53 / 1 |
 | Freezing | 317 / 3 | 49 / 1 |
 | Missing values | 311 / 3 | 46 / 1 |
+| 32-wide high-entropy radar | n/a | 476 / 4 |
 
 Framing and Base64 overhead are included: these fixtures save **67% of reply
 messages**. Actual values affect size; larger descriptive replies can fragment.
-These are application-message measurements, excluding RF headers, relays,
+The radar fixture uses uniformly randomized cell codes so it verifies the hard
+four-message budget without relying on favorable weather compression. These are
+application-message measurements, excluding RF headers, relays,
 acknowledgments, and retries. Live companion/radio validation is needed to measure
 those effects.
 
