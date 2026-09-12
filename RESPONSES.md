@@ -7,27 +7,12 @@ Examples use placeholder values in angle brackets. Lines shown together are sent
 ```text
 ☀️ <City>, <ST> <ZIPCODE>
 🌡️ <temperature>°F · <conditions>
-☀️ Heat index <heat index>°F · 💧 <humidity>% · 💨 <direction> <speed> mph
-✅ No active NWS alerts
+☀️ Feels like <apparent temperature>°F · 💧 <humidity>% · 💨 <direction> <speed> mph
 ```
 
-The heat-index portion is present only when NWS supplies it for the latest observation.
-
-When the latest observation is unavailable, the weather section can instead be:
-
-```text
-☀️ <City>, <ST> <ZIPCODE>
-🌡️ <temperature>°F · <forecast>
-💨 <direction> <speed>
-(current-hour NWS forecast)
-✅ No active NWS alerts
-```
-
-When there is an active alert, the final line is one line per alert instead:
-
-```text
-⚠️ <alert event> (<severity>, until <end time>)
-```
+The feels-like portion is present when Open-Meteo supplies an apparent temperature.
+Normal weather replies do not include alerts; NWS alerts are sent only through automatic
+alert monitoring and `wx report` subscriptions.
 
 ### Lookup error
 
@@ -134,15 +119,13 @@ The weather JSON uses short keys to keep mesh messages small:
   "c": "<conditions>",
   "h": 50,
   "i": 77,
-  "w": "<direction> <speed> mph",
-  "a": [["<alert event>", "<severity>", "<end time>"]]
+  "w": "<direction> <speed> mph"
 }
 ```
 
 `z` is ZIP code, `l` is location, `t` is temperature in °F, `c` is conditions,
-`h` is humidity percent, `i` is heat index in °F, `w` is wind, and `a` is alerts.
-Each alert contains event, severity, and—when available—its end time. Missing weather
-fields are omitted; no active alerts are `"a":[]`.
+`h` is humidity percent, `i` is apparent temperature in °F, and `w` is wind. Missing
+weather fields are omitted.
 
 ### `wx help json`
 

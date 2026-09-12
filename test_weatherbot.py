@@ -48,6 +48,7 @@ class FakeWeatherService(weatherbot.WeatherService):
     def __init__(self):
         super().__init__("weatherbot-tests (tests@example.com)", timeout=1)
         self.alert_params = None
+        self.forecast_params = None
 
     async def _get_json(self, url, params=None):
         if "zippopotam" in url:
@@ -61,45 +62,25 @@ class FakeWeatherService(weatherbot.WeatherService):
                     }
                 ]
             }
-        if "/points/" in url:
+        if "api.open-meteo.com" in url:
+            self.forecast_params = params
             return {
-                "properties": {
-                    "relativeLocation": {
-                        "properties": {"city": "Chicago", "state": "IL"}
-                    },
-                    "observationStations": "https://api.weather.gov/grid/stations",
-                    "forecastHourly": "https://api.weather.gov/grid/hourly",
-                }
-            }
-        if url.endswith("/grid/stations"):
-            return {"features": [{"id": "https://api.weather.gov/stations/KTEST"}]}
-        if url.endswith("/observations/latest"):
-            return {
-                "properties": {
-                    "temperature": {"value": 20, "unitCode": "wmoUnit:degC"},
-                    "textDescription": "Partly Cloudy",
-                    "relativeHumidity": {"value": 50},
-                    "heatIndex": {"value": 25, "unitCode": "wmoUnit:degC"},
-                    "windSpeed": {"value": 16.0934, "unitCode": "wmoUnit:km_h-1"},
-                    "windDirection": {"value": 225},
-                }
-            }
-        if url.endswith("/grid/hourly"):
-            return {
-                "properties": {
-                    "periods": [
-                        {
-                            "startTime": f"2026-08-20T{hour:02d}:00:00-05:00",
-                            "temperature": 68 + index,
-                            "temperatureUnit": "F",
-                            "shortForecast": "Partly Cloudy",
-                            "windDirection": "SW",
-                            "windSpeed": "10 mph",
-                            "probabilityOfPrecipitation": {"value": 10},
-                        }
-                        for index, hour in enumerate(range(12, 17))
-                    ]
-                }
+                "current": {
+                    "temperature_2m": 68,
+                    "apparent_temperature": 77,
+                    "relative_humidity_2m": 50,
+                    "weather_code": 2,
+                    "wind_speed_10m": 10,
+                    "wind_direction_10m": 225,
+                },
+                "hourly": {
+                    "time": [1780000000 + hour * 3600 for hour in range(5)],
+                    "temperature_2m": [68 + hour for hour in range(5)],
+                    "weather_code": [2] * 5,
+                    "wind_speed_10m": [10] * 5,
+                    "wind_direction_10m": [225] * 5,
+                    "precipitation_probability": [10] * 5,
+                },
             }
         if "/alerts/active" in url:
             self.alert_params = params
@@ -121,17 +102,18 @@ class FakeWeatherService(weatherbot.WeatherService):
 
 
 class WeatherFormattingTests(unittest.IsolatedAsyncioTestCase):
-    async def test_current_conditions_and_active_alert(self):
+    async def test_open_meteo_current_conditions_without_alerts(self):
         service = FakeWeatherService()
         report = await service.weather_report("60601")
         await service.close()
         self.assertIn("☀️ Chicago, IL 60601", report)
         self.assertIn("68°F", report)
-        self.assertIn("☀️ Heat index 77°F", report)
+        self.assertIn("☀️ Feels like 77°F", report)
         self.assertIn("💧 50%", report)
         self.assertIn("💨 SW 10 mph", report)
-        self.assertIn("⚠️ Heat Advisory", report)
-        self.assertEqual(service.alert_params, {"point": "41.8858,-87.6181"})
+        self.assertNotIn("NWS alert", report)
+        self.assertEqual(service.forecast_params["temperature_unit"], "fahrenheit")
+        self.assertEqual(service.forecast_params["wind_speed_unit"], "mph")
 
     async def test_weather_json_is_a_compact_text_summary(self):
         service = FakeWeatherService()
@@ -143,11 +125,10 @@ class WeatherFormattingTests(unittest.IsolatedAsyncioTestCase):
                 "z": "60601",
                 "l": "Chicago, IL",
                 "t": 68,
-                "c": "Partly Cloudy",
+                "c": "Partly cloudy",
                 "h": 50,
                 "i": 77,
                 "w": "SW 10 mph",
-                "a": [["Heat Advisory", "Moderate", "Aug 20 8:00 PM CDT"]],
             },
         )
 
@@ -159,7 +140,7 @@ class WeatherFormattingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(report["h"]), 5)
         self.assertEqual(report["h"][0]["t"], 68)
         self.assertEqual(report["n"]["i"], 77)
-        self.assertEqual(report["a"][0][:2], ["Heat Advisory", "Moderate"])
+        self.assertEqual(report["a"], [])
 
     async def test_report_lines_fit_mesh_limit(self):
         service = FakeWeatherService()
@@ -530,7 +511,7 @@ class FakeSetupCommands:
 
 class FakeBriefWeather:
     async def weather_report(self, zip_code):
-        return f"WX {zip_code}: Clear, 72F. No active NWS alerts."
+        return f"WX {zip_code}: Clear, 72F."
 
     async def weather_api_all(self, zip_code):
         return {

@@ -1,5 +1,8 @@
 # Mesh JSON API v1
 
+For the opt-in compressed successor, see [Compact API v2](API_V2.md).
+V1 commands and framing described here remain available.
+
 This is the app-facing protocol for the pyMC/openHop Weather Bot. It is designed for
 MeshCore's 140-byte message limit. The older `json` commands are unchanged; clients
 that need this protocol must append `api` exactly as shown below (command matching is
@@ -10,7 +13,7 @@ case-insensitive).
 | Request | Purpose |
 | --- | --- |
 | `bot json api` | Discover this bot's API version and capabilities. |
-| `wx ZIPCODE json all api` | Get current conditions, up to five hourly forecasts, and active alerts. |
+| `wx ZIPCODE json all api` | Get current conditions and up to five hourly forecasts. |
 
 Requests work in a DM or the configured Weather channel. The ZIP must be a US
 five-digit ZIP (ZIP+4 is accepted and reduced to five digits).
@@ -59,28 +62,23 @@ After merging, a normal `wx ZIPCODE json all api` response has this shape:
   "g":1780000000,
   "n":[68,2,50,225,10,77],
   "h":[[0,68,2,225,10,10],[60,69,1,225,9,0]],
-  "a":[[6,2]],
-  "x":true
+  "a":[]
 }
 ```
 
 - `z`: ZIP
 - `g`: generation time as Unix seconds (UTC)
-- `n`: current row in `[temperature_F, weather_code, humidity_percent, wind_direction_degrees, wind_mph, heat_index_F]` order. Heat index is `null` when NWS does not report one.
+- `n`: current row in `[temperature_F, weather_code, humidity_percent, wind_direction_degrees, wind_mph, apparent_temperature_F]` order. Apparent temperature is Open-Meteo's feels-like value.
 - `h`: hourly rows in `[minutes_after_g, temperature_F, weather_code, wind_direction_degrees, wind_mph, precipitation_percent]` order. The bot returns no more than the next five rows. Optional source values are `null`.
-- `a`: alert rows in `[alert_code, severity_code]` order; an empty array means no active alerts
-- `x`: present and `true` only when more than five alerts were available
+- `a`: always an empty array. NWS alerts are delivered only through configured automatic alerts and `wx report` subscriptions.
 
 Weather codes: `0` unknown/other, `1` clear, `2` partly cloudy, `3` mostly cloudy,
 `4` cloudy, `5` rain, `6` thunderstorm, `7` snow/ice, `8` fog/haze, `9` wind.
-Alert codes: `0` other, `1` tornado, `2` thunder/lightning, `3` flood, `4` wind,
-`5` winter, `6` heat, `7` hurricane/tropical, `8` fire, `9` air quality. Severity
-codes: `0` unknown, `1` minor, `2` moderate, `3` severe, `4` extreme.
 
-The API is a compact curated forecast, not a raw NWS response. It contains no
+The API is a compact curated Open-Meteo forecast, not a raw provider response. It contains no
 display-oriented text. Values are normalized to Fahrenheit, mph, percent, and numeric
 codes. To guarantee at most three 140-byte messages, it retains no more than five
-active alerts and always prefers retaining current data and five hourly rows.
+hourly rows.
 
 ## Errors
 

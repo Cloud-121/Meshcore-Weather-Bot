@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NOAA weather bot for an openHop Repeater companion TCP port."""
+"""Open-Meteo weather and NWS alert bot for an openHop Repeater companion TCP port."""
 
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ from typing import Any, Optional, Sequence
 from zoneinfo import ZoneInfo
 
 import httpx
+import api_v2
 from meshcore import EventType, MeshCore
 
 
@@ -75,6 +76,7 @@ class InboundMessage:
     sender_timestamp: Optional[int] = None
     approx_direct_miles: Optional[float] = None
     received_at: Optional[datetime] = None
+    api_version: int = 0
 
     @property
     def is_channel(self) -> bool:
@@ -116,7 +118,7 @@ class BotConfig:
 
 
 class WeatherService:
-    """Resolve ZIPs and retrieve observations, forecasts, and alerts."""
+    """Resolve ZIPs, retrieve Open-Meteo data, and poll NWS alerts."""
 
     def __init__(self, user_agent: str, timeout: float = 15.0) -> None:
         self.timeout = timeout
@@ -168,35 +170,14 @@ class WeatherService:
         except (KeyError, TypeError, ValueError) as exc:
             raise WeatherError("ZIP service returned invalid coordinates") from exc
 
-        point = await self._get_json(
-            f"https://api.weather.gov/points/{latitude:.4f},{longitude:.4f}"
-        )
-        properties = point.get("properties") or {}
-        relative = ((properties.get("relativeLocation") or {}).get("properties") or {})
-        city = str(relative.get("city") or place.get("place name") or zip_code)
-        state = str(relative.get("state") or place.get("state abbreviation") or "")
-        hourly_url = properties.get("forecastHourly")
-        stations_url = properties.get("observationStations")
-        station_url: Optional[str] = None
-        if stations_url:
-            try:
-                stations = await self._get_json(str(stations_url))
-                features = stations.get("features") or []
-                if features:
-                    station_url = features[0].get("id") or (
-                        features[0].get("properties") or {}
-                    ).get("@id")
-            except WeatherError:
-                LOG.warning("Could not resolve observation station for %s", zip_code)
-
         location = Location(
             zip_code=zip_code,
             latitude=latitude,
             longitude=longitude,
-            city=city,
-            state=state,
-            station_url=str(station_url) if station_url else None,
-            hourly_url=str(hourly_url) if hourly_url else None,
+            city=str(place.get("place name") or zip_code),
+            state=str(place.get("state abbreviation") or ""),
+            station_url=None,
+            hourly_url=None,
         )
         self.locations[zip_code] = location
         return location
@@ -210,262 +191,109 @@ class WeatherService:
 
     async def weather_report(self, zip_code: str) -> str:
         location = await self.resolve_zip(zip_code)
-        condition_lines = await self._current_conditions(location)
-        alerts = await self.active_alerts(location)
+        current, _hourly = await self._forecast(location)
         lines = [f"☀️ {location.city}, {location.state} {location.zip_code}"]
-        lines.extend(condition_lines)
-        if not alerts:
-            lines.append("✅ No active NWS alerts")
+        temperature = number_or_none(current.get("temperature_2m"))
+        description = open_meteo_weather_description(current.get("weather_code"))
+        if temperature is not None:
+            lines.append(f"🌡️ {round(temperature)}°F · {description}")
         else:
-            for alert in alerts:
-                properties = alert.get("properties") or {}
-                event = clean_text(str(properties.get("event") or "Weather Alert"))
-                severity = clean_text(str(properties.get("severity") or "Unknown"))
-                ends = format_alert_time(
-                    properties.get("ends") or properties.get("expires"),
-                    str(properties.get("timeZone") or ""),
-                )
-                timing = f", until {ends}" if ends else ""
-                lines.append(f"⚠️ {event} ({severity}{timing})")
+            lines.append(f"🌡️ {description}")
+        stats: list[str] = []
+        apparent = number_or_none(current.get("apparent_temperature"))
+        if apparent is not None:
+            stats.append(f"☀️ Feels like {round(apparent)}°F")
+        humidity = number_or_none(current.get("relative_humidity_2m"))
+        if humidity is not None:
+            stats.append(f"💧 {round(humidity)}%")
+        wind = open_meteo_wind(current)
+        if wind:
+            stats.append(f"💨 {wind}")
+        if stats:
+            lines.append(" · ".join(stats))
         return "\n".join(lines)
 
     async def weather_json(self, zip_code: str) -> dict[str, Any]:
-        """Return the small weather summary shown in the text report."""
+        """Return the compact Open-Meteo summary shown in the text report."""
         location = await self.resolve_zip(zip_code)
-        conditions: dict[str, Any] = {}
-        source = ""
-        if location.station_url:
-            try:
-                observation = await self._get_json(
-                    location.station_url.rstrip("/") + "/observations/latest"
-                )
-                conditions = observation.get("properties") or {}
-                source = "observation"
-            except WeatherError:
-                pass
-        if not conditions and location.hourly_url:
-            try:
-                hourly = await self._get_json(location.hourly_url)
-                periods = (hourly.get("properties") or {}).get("periods") or []
-                if periods and isinstance(periods[0], dict):
-                    conditions = periods[0]
-                    source = "hourly_forecast"
-            except WeatherError:
-                pass
-        alerts = await self.active_alerts(location)
+        current, _hourly = await self._forecast(location)
         report: dict[str, Any] = {
             "z": location.zip_code,
             "l": f"{location.city}, {location.state}",
         }
-
-        if source == "observation":
-            temperature = quantity(conditions.get("temperature"))
-            if temperature is not None:
-                report["t"] = round(
-                    to_fahrenheit(temperature, unit_code(conditions.get("temperature")))
-                )
-            heat_index = observation_heat_index(conditions)
-            if heat_index is not None:
-                report["i"] = round(heat_index)
-            description = clean_text(str(conditions.get("textDescription") or ""))
-            if description:
-                report["c"] = description
-            humidity = quantity(conditions.get("relativeHumidity"))
-            if humidity is not None:
-                report["h"] = round(humidity)
-            wind = quantity(conditions.get("windSpeed"))
-            if wind is not None:
-                mph = to_mph(wind, unit_code(conditions.get("windSpeed")))
-                if mph < 1:
-                    report["w"] = "calm"
-                else:
-                    direction = quantity(conditions.get("windDirection"))
-                    compass = degrees_to_compass(direction) if direction is not None else ""
-                    report["w"] = f"{compass} {round(mph)} mph".strip()
-        elif source == "hourly_forecast":
-            temperature = conditions.get("temperature")
-            if temperature is not None:
-                value = float(temperature)
-                if str(conditions.get("temperatureUnit") or "F").upper() == "C":
-                    value = value * 9 / 5 + 32
-                report["t"] = round(value)
-            forecast = clean_text(str(conditions.get("shortForecast") or ""))
-            if forecast:
-                report["c"] = forecast
-            wind = clean_text(
-                f"{conditions.get('windDirection') or ''} {conditions.get('windSpeed') or ''}"
-            )
-            if wind:
-                report["w"] = wind
-
-        alert_summaries: list[list[str]] = []
-        for alert in alerts:
-            properties = alert.get("properties") or {}
-            event = clean_text(str(properties.get("event") or "Weather Alert"))
-            severity = clean_text(str(properties.get("severity") or "Unknown"))
-            summary = [event, severity]
-            ends = format_alert_time(
-                properties.get("ends") or properties.get("expires"),
-                str(properties.get("timeZone") or ""),
-            )
-            if ends:
-                summary.append(ends)
-            alert_summaries.append(summary)
-        report["a"] = alert_summaries
+        temperature = number_or_none(current.get("temperature_2m"))
+        if temperature is not None:
+            report["t"] = round(temperature)
+        apparent = number_or_none(current.get("apparent_temperature"))
+        if apparent is not None:
+            report["i"] = round(apparent)
+        report["c"] = open_meteo_weather_description(current.get("weather_code"))
+        humidity = number_or_none(current.get("relative_humidity_2m"))
+        if humidity is not None:
+            report["h"] = round(humidity)
+        wind = open_meteo_wind(current)
+        if wind:
+            report["w"] = wind
         return report
 
     async def weather_api_all(self, zip_code: str) -> dict[str, Any]:
-        """Return the curated data set used by the versioned mesh API."""
+        """Return the curated Open-Meteo data set used by the mesh API."""
         location = await self.resolve_zip(zip_code)
-        observation: dict[str, Any] = {}
-        if location.station_url:
-            try:
-                data = await self._get_json(location.station_url.rstrip("/") + "/observations/latest")
-                observation = data.get("properties") or {}
-            except WeatherError:
-                pass
-
-        periods: list[dict[str, Any]] = []
-        if location.hourly_url:
-            try:
-                hourly = await self._get_json(location.hourly_url)
-                periods = [item for item in ((hourly.get("properties") or {}).get("periods") or []) if isinstance(item, dict)][:5]
-            except WeatherError:
-                pass
-        alerts = await self.active_alerts(location)
-
-        current: dict[str, Any] = {}
-        if observation:
-            temperature = quantity(observation.get("temperature"))
-            if temperature is not None:
-                current["t"] = round(to_fahrenheit(temperature, unit_code(observation.get("temperature"))))
-            heat_index = observation_heat_index(observation)
-            if heat_index is not None:
-                current["i"] = round(heat_index)
-            description = clean_text(str(observation.get("textDescription") or ""))
-            if description:
-                current["c"] = description
-            humidity = quantity(observation.get("relativeHumidity"))
-            if humidity is not None:
-                current["h"] = round(humidity)
-            wind = quantity(observation.get("windSpeed"))
-            if wind is not None:
-                mph = to_mph(wind, unit_code(observation.get("windSpeed")))
-                current["w"] = "calm" if mph < 1 else f"{degrees_to_compass(quantity(observation.get('windDirection')))} {round(mph)}"
-        elif periods:
-            current = api_period_data(periods[0], 0)
-            current.pop("m", None)
-
+        conditions, periods = await self._forecast(location)
+        current = open_meteo_current_data(conditions)
         now = datetime.now(tz=ZoneInfo("UTC"))
-        hourly_data = [api_period_data(period, api_minutes_from(now, period.get("startTime"))) for period in periods]
-        alert_data = []
-        for alert in alerts:
-            properties = alert.get("properties") or {}
-            item = [
-                clean_text(str(properties.get("event") or "Weather Alert")),
-                clean_text(str(properties.get("severity") or "Unknown")),
-            ]
-            ends = format_alert_time(properties.get("ends") or properties.get("expires"), str(properties.get("timeZone") or ""))
-            if ends:
-                item.append(ends)
-            alert_data.append(item)
+        hourly_data = [
+            open_meteo_hourly_data(period, api_minutes_from(now, period.get("time")))
+            for period in periods
+        ]
         return {
             "k": "w",
             "z": location.zip_code,
             "g": int(now.timestamp()),
             "n": current,
             "h": hourly_data,
-            "a": alert_data,
+            "a": [],
         }
 
-    async def _current_conditions(self, location: Location) -> list[str]:
-        if location.station_url:
-            try:
-                observation = await self._get_json(
-                    location.station_url.rstrip("/") + "/observations/latest"
-                )
-                properties = observation.get("properties") or {}
-                temperature = quantity(properties.get("temperature"))
-                description = clean_text(str(properties.get("textDescription") or ""))
-                lines: list[str] = []
-                temperature_line = ""
-                if temperature is not None:
-                    fahrenheit = to_fahrenheit(
-                        temperature, unit_code(properties.get("temperature"))
-                    )
-                    temperature_line = f"{round(fahrenheit)}°F"
-                if description:
-                    temperature_line = (
-                        f"{temperature_line} · {description}"
-                        if temperature_line
-                        else description
-                    )
-                if temperature_line:
-                    lines.append(f"🌡️ {temperature_line}")
-
-                humidity = quantity(properties.get("relativeHumidity"))
-                heat_index = observation_heat_index(properties)
-                wind_parts: list[str] = []
-                wind = quantity(properties.get("windSpeed"))
-                if wind is not None:
-                    mph = to_mph(wind, unit_code(properties.get("windSpeed")))
-                    direction = quantity(properties.get("windDirection"))
-                    if mph < 1:
-                        wind_parts.append("calm")
-                    else:
-                        compass = (
-                            degrees_to_compass(direction)
-                            if direction is not None
-                            else ""
-                        )
-                        wind_parts.append(f"{compass} {round(mph)} mph")
-                stats: list[str] = []
-                if heat_index is not None:
-                    stats.append(f"☀️ Heat index {round(heat_index)}°F")
-                if humidity is not None:
-                    stats.append(f"💧 {round(humidity)}%")
-                if wind_parts:
-                    stats.append(f"💨 {wind_parts[0]}")
-                if stats:
-                    lines.append(" · ".join(stats))
-                if lines:
-                    return lines
-            except WeatherError:
-                LOG.warning(
-                    "Latest observation unavailable for %s; using hourly forecast",
-                    location.zip_code,
-                )
-
-        if location.hourly_url:
-            hourly = await self._get_json(location.hourly_url)
-            periods = (hourly.get("properties") or {}).get("periods") or []
-            if periods:
-                period = periods[0]
-                temperature = period.get("temperature")
-                if temperature is not None and str(
-                    period.get("temperatureUnit") or "F"
-                ).upper() == "C":
-                    temperature = float(temperature) * 9 / 5 + 32
-                lines: list[str] = []
-                temperature_line = ""
-                if temperature is not None:
-                    temperature_line = f"{round(float(temperature))}°F"
-                if period.get("shortForecast"):
-                    forecast = clean_text(str(period["shortForecast"]))
-                    temperature_line = (
-                        f"{temperature_line} · {forecast}"
-                        if temperature_line
-                        else forecast
-                    )
-                if temperature_line:
-                    lines.append(f"🌡️ {temperature_line}")
-                if period.get("windSpeed"):
-                    wind_direction = period.get("windDirection") or ""
-                    lines.append(f"💨 {wind_direction} {period['windSpeed']}".strip())
-                if lines:
-                    lines.append("(current-hour NWS forecast)")
-                    return lines
-        raise WeatherError("current conditions are unavailable")
+    async def _forecast(
+        self, location: Location
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        data = await self._get_json(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": f"{location.latitude:.4f}",
+                "longitude": f"{location.longitude:.4f}",
+                "current": "temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,wind_direction_10m",
+                "hourly": "temperature_2m,weather_code,wind_speed_10m,wind_direction_10m,precipitation_probability",
+                "forecast_hours": "5",
+                "temperature_unit": "fahrenheit",
+                "wind_speed_unit": "mph",
+                "timeformat": "unixtime",
+            },
+        )
+        current = data.get("current")
+        hourly = data.get("hourly")
+        if not isinstance(current, dict) or not isinstance(hourly, dict):
+            raise WeatherError("weather service returned invalid data")
+        times = hourly.get("time")
+        if not isinstance(times, list):
+            raise WeatherError("weather service returned invalid data")
+        fields = (
+            "temperature_2m",
+            "weather_code",
+            "wind_speed_10m",
+            "wind_direction_10m",
+            "precipitation_probability",
+        )
+        periods: list[dict[str, Any]] = []
+        for index, timestamp in enumerate(times[:5]):
+            period = {"time": timestamp}
+            for field in fields:
+                values = hourly.get(field)
+                if isinstance(values, list) and index < len(values):
+                    period[field] = values[index]
+            periods.append(period)
+        return current, periods
 
 
 class WeatherBot:
@@ -834,6 +662,41 @@ class WeatherBot:
         ):
             return False
         command = command_text(message.text, message.is_channel)
+        # Explicit opt-in only; the original message remains the deduplication key.
+        if re.search(r"\s+api2\s*$", command, re.IGNORECASE):
+            command = re.sub(r"\s+api2\s*$", "", command, flags=re.IGNORECASE).strip()
+            message = replace(message, api_version=2)
+            if re.fullmatch(r"ping", command, re.IGNORECASE):
+                command = "ping json"
+            else:
+                if message.is_channel and message.channel_index != self.config.weather_channel_index:
+                    return False
+                if re.fullmatch(r"bot|wx\s+help", command, re.IGNORECASE):
+                    await self._reply_v2(mesh, message, {
+                        "type": "discovery", "cmd": 127,
+                        "lim": [140, api_v2.MAX_PARTS], "u": ["F", "mph", "%"],
+                    })
+                    return True
+                match = re.fullmatch(r"wx\s+(\d{5})(?:-\d{4})?\s+all", command, re.IGNORECASE)
+                if match:
+                    key = self._request_key(message)
+                    if key is not None:
+                        if self._is_seen(key):
+                            return True
+                        self._note_seen(key)
+                    try:
+                        data, clipped = _compact_api_object(await self.weather.weather_api_all(match.group(1)))
+                        if clipped:
+                            data["x"] = True
+                    except WeatherError as exc:
+                        data = {"type": "error", "command": "wx", "zip_code": match.group(1),
+                                "error": api_error_code(exc)}
+                    await self._reply_v2(mesh, message, data)
+                    return True
+                if not re.fullmatch(r"wx\s+(?:\d{5}(?:-\d{4})?|version|report\s+(?:\d{5}(?:-\d{4})?|stop))", command, re.IGNORECASE):
+                    await self._reply_v2(mesh, message, {"type": "error", "command": "api2", "error": 5})
+                    return True
+                command += " json"
         ping_match = PING_COMMAND.fullmatch(command)
         if ping_match:
             if message.is_channel and message.channel_index != self.config.test_channel_index:
@@ -978,6 +841,17 @@ class WeatherBot:
     async def _reply(
         self, mesh: Any, message: InboundMessage, response: str | dict[str, Any]
     ) -> None:
+        if message.api_version == 2:
+            if not isinstance(response, dict):
+                raise MeshError("API v2 requires a structured response")
+            data = dict(response)
+            if "type" not in data:
+                data["type"] = "current"
+            if data.get("type") == "error":
+                data["error"] = (4 if data.get("command") == "wx report"
+                                 else api_error_code(WeatherError(str(data.get("error", "")))))
+            await self._reply_v2(mesh, message, data)
+            return
         if not message.is_channel:
             if not message.sender_prefix:
                 raise MeshError("a queued DM did not include its sender key prefix")
@@ -1001,6 +875,24 @@ class WeatherBot:
         for chunk in chunks:
             LOG.debug("Sending DM chunk (%d bytes) to %s", len(chunk.encode("utf-8")), message.sender_prefix[:12])
             await self.send_dm_with_fallback(mesh, message.sender_prefix, chunk)
+
+    async def _reply_v2(self, mesh: Any, message: InboundMessage, data: dict[str, Any]) -> None:
+        flood_warning = False
+        if not message.is_channel:
+            if not message.sender_prefix:
+                raise MeshError("a queued DM did not include its sender key prefix")
+            flood_warning = not await self._has_contact(mesh, message.sender_prefix)
+        try:
+            chunks = api_v2.encode(data, flood_warning=flood_warning)
+        except (ValueError, TypeError, KeyError, OverflowError):
+            LOG.exception("Could not encode API v2 response")
+            chunks = api_v2.encode({"type": "error", "command": "api2", "error": 3},
+                                   flood_warning=flood_warning)
+        for chunk in chunks:
+            if message.is_channel:
+                await self.send_channel(mesh, chunk, message.channel_index)
+            else:
+                await self.send_dm_with_fallback(mesh, message.sender_prefix, chunk)
 
     async def _reply_api(
         self, mesh: Any, message: InboundMessage, parts: list[dict[str, Any]]
@@ -1495,12 +1387,101 @@ def api_clip(value: Any, byte_limit: int) -> tuple[str, bool]:
 
 def api_minutes_from(now: datetime, start_time: Any) -> int:
     try:
+        if isinstance(start_time, (int, float)):
+            return max(0, round((float(start_time) - now.timestamp()) / 60))
         start = datetime.fromisoformat(str(start_time).replace("Z", "+00:00"))
         if start.tzinfo is None:
             return 0
         return max(0, round((start.astimezone(ZoneInfo("UTC")) - now).total_seconds() / 60))
     except (TypeError, ValueError):
         return 0
+
+
+def number_or_none(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def open_meteo_weather_description(value: Any) -> str:
+    code = integer_or_none(value)
+    descriptions = {
+        0: "Clear sky",
+        1: "Mostly clear",
+        2: "Partly cloudy",
+        3: "Overcast",
+        45: "Fog",
+        48: "Rime fog",
+        51: "Light drizzle",
+        53: "Drizzle",
+        55: "Heavy drizzle",
+        56: "Freezing drizzle",
+        57: "Heavy freezing drizzle",
+        61: "Light rain",
+        63: "Rain",
+        65: "Heavy rain",
+        66: "Freezing rain",
+        67: "Heavy freezing rain",
+        71: "Light snow",
+        73: "Snow",
+        75: "Heavy snow",
+        77: "Snow grains",
+        80: "Rain showers",
+        81: "Heavy rain showers",
+        82: "Violent rain showers",
+        85: "Snow showers",
+        86: "Heavy snow showers",
+        95: "Thunderstorm",
+        96: "Thunderstorm with hail",
+        99: "Severe thunderstorm with hail",
+    }
+    return descriptions.get(code, "Unknown conditions")
+
+
+def open_meteo_wind(data: dict[str, Any]) -> str:
+    speed = number_or_none(data.get("wind_speed_10m"))
+    if speed is None:
+        return ""
+    if speed < 1:
+        return "calm"
+    direction = number_or_none(data.get("wind_direction_10m"))
+    compass = degrees_to_compass(direction) if direction is not None else ""
+    return f"{compass} {round(speed)} mph".strip()
+
+
+def open_meteo_current_data(data: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {"c": open_meteo_weather_description(data.get("weather_code"))}
+    temperature = number_or_none(data.get("temperature_2m"))
+    if temperature is not None:
+        result["t"] = round(temperature)
+    apparent = number_or_none(data.get("apparent_temperature"))
+    if apparent is not None:
+        result["i"] = round(apparent)
+    humidity = number_or_none(data.get("relative_humidity_2m"))
+    if humidity is not None:
+        result["h"] = round(humidity)
+    wind = open_meteo_wind(data)
+    if wind:
+        result["w"] = wind
+    return result
+
+
+def open_meteo_hourly_data(period: dict[str, Any], minutes: int) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "m": minutes,
+        "c": open_meteo_weather_description(period.get("weather_code")),
+    }
+    temperature = number_or_none(period.get("temperature_2m"))
+    if temperature is not None:
+        result["t"] = round(temperature)
+    wind = open_meteo_wind(period)
+    if wind:
+        result["w"] = wind
+    precipitation = number_or_none(period.get("precipitation_probability"))
+    if precipitation is not None:
+        result["p"] = round(precipitation)
+    return result
 
 
 def api_period_data(period: dict[str, Any], minutes: int) -> dict[str, Any]:

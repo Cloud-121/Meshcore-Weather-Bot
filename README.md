@@ -6,18 +6,25 @@ of the repeater's companion TCP ports through the maintained
 [`meshcore` Python client](https://github.com/meshcore-dev/meshcore_py); it does not
 need `openhop_core` or a separate radio.
 
-It responds to `wx ZIPCODE` in a DM or in `#Weather`. `wx help` lists commands and
+It responds to `wx ZIPCODE` in a DM or in `#Weather` with current conditions and a
+five-hour forecast from Open-Meteo. `wx help` lists commands and
 identifies the bot as a Gulf Coast Mesh boat designed by ScarlettOSA. `wx version`
 reports the Git commit currently running. Append `json` to any `wx` command (for
 example, `wx 70818 json` or `wx help json`) to receive a compact structured JSON
 response instead of the normal text reply.
 
-Current observations include the NWS heat index when available. The text response
-labels it `Heat index`; the compact `wx ZIPCODE json` response uses the `i` key.
+Current conditions include Open-Meteo's modelled apparent (feels-like) temperature.
+The text response labels it `Feels like`; the compact `wx ZIPCODE json` response uses
+the `i` key.
 
 For app integrations, see [the versioned mesh JSON API](JSON_API.md). It uses
-`bot json api` for discovery and `wx ZIPCODE json all api` for compact current,
-alert, and five-hour forecast data; existing `json` commands remain unchanged.
+`bot json api` for discovery and `wx ZIPCODE json all api` for compact current and
+five-hour forecast data; existing `json` commands remain unchanged.
+
+For smaller machine replies, see [Compact API v2](API_V2.md). Send
+`wx 60601 all api2` for a binary-packed forecast carried as Base64url text, or
+`bot api2` for discovery. The reference decoder is in `api_v2.py`. Normal commands
+and automatic alerts remain human-readable; existing JSON formats are preserved.
 
 Use `wx report ZIPCODE` in a DM to subscribe that identity to NOAA alerts for a ZIP;
 repeat it to add more ZIPs. Every report alert is sent by DM and ends with
@@ -41,9 +48,10 @@ from the same sender for the same ZIP are deduplicated for `request_dedup_second
 (default 120) so a retry never triggers a second reply. Channel replies and automatic
 alerts are normal encrypted channel floods.
 
-Weather observations and active watches/warnings/advisories come from the US National
-Weather Service. ZIP centroids come from Zippopotam.us because `api.weather.gov`
-accepts coordinates, not ZIP codes.
+Weather conditions and forecasts come from Open-Meteo's model data. Active
+watches/warnings/advisories and `wx report` subscriptions continue to come from the US
+National Weather Service. ZIP centroids come from Zippopotam.us because both providers
+accept coordinates, not ZIP codes.
 
 ## 1. Configure an openHop companion
 
@@ -86,7 +94,7 @@ python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -r requirements.txt
 cp config.json.example config.json
-# Edit the repeater address, channel, ZIPs, and the required NWS User-Agent contact.
+# Edit the repeater address, channel, ZIPs, and the required NWS User-Agent contact for alerts.
 python weatherbot.py --config config.json
 ```
 
@@ -119,7 +127,7 @@ Use absolute paths matching your checkout:
 
 ```ini
 [Unit]
-Description=openHop NOAA Weather Bot
+Description=openHop Weather and Alert Bot
 After=network-online.target openhop-repeater.service
 Wants=network-online.target
 
@@ -142,8 +150,9 @@ containing `state_file`.
 
 - US five-digit ZIP codes are supported. ZIP+4 input is accepted and reduced to its
   first five digits.
-- NWS observations can be delayed; when the nearest station is unavailable the bot
-  clearly labels the NWS current-hour forecast fallback.
+- Open-Meteo current conditions are modelled 15-minute data, not a nearby station
+  observation. The source automatically selects the highest-resolution applicable
+  forecast model for the requested location.
 - Alert messages are concise and may be split into numbered MeshCore chunks. Always
   follow official local instructions; this bot is not a replacement for NOAA Weather
   Radio or emergency services.
