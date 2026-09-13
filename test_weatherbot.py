@@ -26,6 +26,9 @@ def make_config(state_file, **changes):
         weather_channel_index=1,
         weather_channel_name="Weather",
         weather_channel_key="",
+        api_channel_index=3,
+        api_channel_name="wx-bot-hidden",
+        api_channel_key="",
         test_channel_index=2,
         test_channel_name="test",
         alert_zip_codes=[],
@@ -492,7 +495,9 @@ class FakeSetupCommands:
             EventType.CHANNEL_INFO,
             {
                 "channel_idx": index,
-                "channel_name": "Weather" if index == 1 else "test",
+                "channel_name": (
+                    "Weather" if index == 1 else "wx-bot-hidden" if index == 3 else "test"
+                ),
             },
         )
 
@@ -647,12 +652,14 @@ class MeshAdapterTests(unittest.IsolatedAsyncioTestCase):
             config = make_config(
                 Path(directory) / "state.json",
                 weather_channel_key=base64.b64encode(key).decode(),
+                api_channel_key=base64.b64encode(key[::-1]).decode(),
             )
             bot = weatherbot.WeatherBot(config, weather=FakeBriefWeather())
             commands = FakeSetupCommands()
             mesh = FakeMesh(commands)
             await bot._prepare_mesh(mesh)
         self.assertIn(("set_channel", 1, "Weather", key), commands.calls)
+        self.assertIn(("set_channel", 3, "wx-bot-hidden", key[::-1]), commands.calls)
         self.assertIn(("send_advert", True), commands.calls)
         self.assertIn("aabbccddeeff", bot._contacts)
         self.assertTrue(mesh.decrypt_channel_logs)
@@ -680,13 +687,14 @@ class MeshAdapterTests(unittest.IsolatedAsyncioTestCase):
             mesh = FakeMesh(commands)
             self.assertTrue(
                 await bot.handle_message(
-                    mesh, weatherbot.InboundMessage("wx 60601 json all api", channel_index=1)
+                    mesh, weatherbot.InboundMessage("wx 60601 json all api", channel_index=3)
                 )
             )
         self.assertEqual(len(commands.channel_messages), 3)
         envelopes = [json.loads(text) for _index, text in commands.channel_messages]
         self.assertTrue(all(envelope["d"].get("k") != "wx" for envelope in envelopes))
         self.assertTrue(all(len(text.encode("utf-8")) <= 140 for _index, text in commands.channel_messages))
+        self.assertTrue(all(index == 3 for index, _text in commands.channel_messages))
 
 
 class FakeAlertWeather:

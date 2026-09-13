@@ -12,7 +12,7 @@ documented schemas. The receiving app must decode it before displaying it.
 
 ## Quick start
 
-Send `wx 60601 all api2` in a DM or on the configured Weather channel. Decode the
+Send `wx 60601 all api2` in a DM or on the configured `#wx-bot-hidden` channel. Decode the
 complete response in your app:
 
 ```python
@@ -35,19 +35,19 @@ normalized to the first five digits. Leading zeroes survive encoding.
 
 | Request | Reply | Where |
 | --- | --- | --- |
-| `bot api2` | Capabilities | DM or Weather channel |
-| `wx help api2` | Same capabilities | DM or Weather channel |
-| `wx ZIPCODE all api2` | Binary current + up to five hours + coded alerts | DM or Weather channel |
-| `wx radar LAT LON TIME api2` | 50-mile circular observed/forecast reflectivity grid | DM or Weather channel |
-| `wx ZIPCODE api2` | Current summary, with location and descriptions | DM or Weather channel |
-| `wx version api2` | Git version | DM or Weather channel |
-| `ping api2` | Receipt time, route, optional distance | DM or configured test channel |
+| `bot api2` | Capabilities | DM or `#wx-bot-hidden` channel |
+| `wx help api2` | Same capabilities | DM or `#wx-bot-hidden` channel |
+| `wx ZIPCODE all api2` | Binary current + up to five hours + coded alerts | DM or `#wx-bot-hidden` channel |
+| `wx radar LAT LON TIME api2` | 50-mile circular observed/forecast reflectivity grid | DM or `#wx-bot-hidden` channel |
+| `wx ZIPCODE api2` | Current summary, with location and descriptions | DM or `#wx-bot-hidden` channel |
+| `wx version api2` | Git version | DM or `#wx-bot-hidden` channel |
+| `ping api2` | Receipt time, route, optional distance | DM or `#wx-bot-hidden` channel |
 | `wx report ZIPCODE api2` | Subscription acknowledgment | DM only |
 | `wx report stop api2` | Unsubscribe acknowledgment | DM only |
 
 Do not add `json`: `api2` selects the new format directly. Unsupported `api2`
-commands in DM/Weather receive error 5. Disallowed channels are ignored, including
-ping requests on Weather.
+commands in a DM or on `wx-bot-hidden` receive error 5. API v2 requests on other
+channels are ignored, as are human-readable commands on `wx-bot-hidden`.
 
 Radar `TIME` is `now` or an explicitly signed whole-hour offset from `-5h` through
 `+5h`. `now` and non-positive offsets return observed MRMS reflectivity; positive
@@ -469,7 +469,7 @@ part of the protocol and must not be reordered by implementations.
 ```
 
 `cmd` capability bits: 0 discovery/help, 1 current summary, 2 combined weather,
-3 version, 4 ping, 5 report enable, 6 report stop, 7 radar. `lim` is maximum message bytes
+3 version, 4 ping, 5 report enable, 6 report stop, and 7 radar. `lim` is maximum message bytes
 and maximum fragments. `u` supplies standard units. Help sends capabilities instead
 of static prose; the client provides instructions and display labels.
 

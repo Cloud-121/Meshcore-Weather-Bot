@@ -17,11 +17,12 @@ Current conditions include Open-Meteo's modelled apparent (feels-like) temperatu
 The text response labels it `Feels like`; the compact `wx ZIPCODE json` response uses
 the `i` key.
 
-For app integrations, see [the versioned mesh JSON API](JSON_API.md). It uses
+For app integrations on the `#wx-bot-hidden` channel, see
+[the versioned mesh JSON API](JSON_API.md). It uses
 `bot json api` for discovery and `wx ZIPCODE json all api` for compact current and
 five-hour forecast data; existing `json` commands remain unchanged.
 
-For smaller machine replies, see [Compact API v2](API_V2.md). Send
+For smaller machine replies on `#wx-bot-hidden`, see [Compact API v2](API_V2.md). Send
 `wx 60601 all api2` for a binary-packed forecast carried as Base64url text, or
 `bot api2` for discovery. The reference decoder is in `api_v2.py`. Normal commands
 and automatic alerts remain human-readable; existing JSON formats are preserved.
@@ -86,6 +87,12 @@ You can do that in a companion app/dashboard, or put the Base64 key in
 `weather_channel_key` and the bot will configure it at startup. A 16-byte key encodes
 to 24 Base64 characters. Leave the value empty to use the channel already stored by
 the repeater. The bot verifies the channel name before transmitting.
+
+Configure `api_channel_index` (default `3`) as the normal shared channel
+`wx-bot-hidden`. Put its Base64 channel key in `api_channel_key`, or leave it
+empty when the channel is already stored by the repeater. Channel API and API v2
+requests are accepted only there; human-readable weather commands and alerts remain
+on `#Weather`. API requests in DMs are also supported.
 
 Also configure `test_channel_index` as `test` (or set both matching values in
 `config.json`). The bot verifies that channel at startup and uses it only for public

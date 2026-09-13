@@ -15,7 +15,7 @@ case-insensitive).
 | `bot json api` | Discover this bot's API version and capabilities. |
 | `wx ZIPCODE json all api` | Get current conditions and up to five hourly forecasts. |
 
-Requests work in a DM or the configured Weather channel. The ZIP must be a US
+Requests work in a DM or on the configured `#wx-bot-hidden` channel. The ZIP must be a US
 five-digit ZIP (ZIP+4 is accepted and reduced to five digits).
 
 ## Fragment envelope

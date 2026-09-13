@@ -164,8 +164,9 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             ("wx 60601", 1, "WX 60601"),
         ]:
             self.commands.channel_messages.clear()
+            channel = 3 if command.endswith("api2") or command.endswith(" api") else 1
             self.assertTrue(await self.bot.handle_message(
-                self.mesh, weatherbot.InboundMessage(command, channel_index=1)))
+                self.mesh, weatherbot.InboundMessage(command, channel_index=channel)))
             self.assertEqual(len(self.commands.channel_messages), count)
             self.assertTrue(self.commands.channel_messages[0][1].startswith(prefix))
 
@@ -173,7 +174,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         for command, kind in [("bot api2", "discovery"), ("wx help api2", "discovery"),
                               ("wx version api2", "version"), ("bad api2", "error")]:
             self.commands.channel_messages.clear()
-            await self.bot.handle_message(self.mesh, weatherbot.InboundMessage(command, channel_index=1))
+            await self.bot.handle_message(self.mesh, weatherbot.InboundMessage(command, channel_index=3))
             result = api_v2.decode([text for _, text in self.commands.channel_messages])
             self.assertEqual(result["data"]["type"], kind)
         self.assertFalse(await self.bot.handle_message(
@@ -181,21 +182,26 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_dm_warning_subscription_and_ping(self):
         sent = []
+
         async def send(mesh, prefix, text):
             sent.append(text)
+
         with patch.object(self.bot, "_has_contact", AsyncMock(return_value=False)), \
                 patch.object(self.bot, "send_dm_with_fallback", side_effect=send):
             for command, kind in [("wx report 00601 api2", "report"),
                                   ("wx report stop api2", "report"), ("ping api2", "pong")]:
                 sent.clear()
-                await self.bot.handle_message(self.mesh, weatherbot.InboundMessage(command, sender_prefix="abcdef123456"))
+                await self.bot.handle_message(
+                    self.mesh,
+                    weatherbot.InboundMessage(command, sender_prefix="abcdef123456"),
+                )
                 result = api_v2.decode(sent)
                 self.assertTrue(result["flood_warning"])
                 self.assertEqual(result["data"]["type"], kind)
 
     async def test_weather_error_and_duplicate(self):
         with patch.object(self.bot.weather, "weather_api_all", AsyncMock(side_effect=weatherbot.WeatherError("ZIP code was not found"))):
-            message = weatherbot.InboundMessage("wx 00000 all api2", channel_index=1, sender_timestamp=123)
+            message = weatherbot.InboundMessage("wx 00000 all api2", channel_index=3, sender_timestamp=123)
             await self.bot.handle_message(self.mesh, message)
             await self.bot.handle_message(self.mesh, message)
         self.assertEqual(len(self.commands.channel_messages), 1)
@@ -207,7 +213,8 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.bot.weather, "weather_json", AsyncMock(return_value=current), create=True):
             for command in ["wx 00601 api2", "wx 00601 json"]:
                 self.commands.channel_messages.clear()
-                await self.bot.handle_message(self.mesh, weatherbot.InboundMessage(command, channel_index=1))
+                channel = 3 if command.endswith("api2") else 1
+                await self.bot.handle_message(self.mesh, weatherbot.InboundMessage(command, channel_index=channel))
                 texts = [text for _, text in self.commands.channel_messages]
                 if command.endswith("api2"):
                     result = api_v2.decode(texts)["data"]
@@ -216,12 +223,21 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
                 else:
                     self.assertTrue(texts[0].startswith("{"))
         self.commands.channel_messages.clear()
-        await self.bot.handle_message(self.mesh, weatherbot.InboundMessage("wx report 00601 api2", channel_index=1))
+        await self.bot.handle_message(self.mesh, weatherbot.InboundMessage("wx report 00601 api2", channel_index=3))
         self.assertEqual(api_v2.decode([self.commands.channel_messages[0][1]])["data"]["error"], 4)
+
+    async def test_channel_api_isolated_to_hidden_channel(self):
+        self.assertFalse(await self.bot.handle_message(
+            self.mesh, weatherbot.InboundMessage("bot api2", channel_index=1)
+        ))
+        self.assertFalse(await self.bot.handle_message(
+            self.mesh, weatherbot.InboundMessage("wx 60601", channel_index=3)
+        ))
+        self.assertEqual(self.commands.channel_messages, [])
 
     async def test_radar_request_response_and_duplicate(self):
         message = weatherbot.InboundMessage(
-            "wx radar 30.4515 -91.1871 +3h api2", channel_index=1,
+            "wx radar 30.4515 -91.1871 +3h api2", channel_index=3,
             sender_timestamp=123,
         )
         await self.bot.handle_message(self.mesh, message)
@@ -234,7 +250,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_radar_request_is_compact_error(self):
         await self.bot.handle_message(
             self.mesh,
-            weatherbot.InboundMessage("wx radar 95 -91 now api2", channel_index=1),
+            weatherbot.InboundMessage("wx radar 95 -91 now api2", channel_index=3),
         )
         result = api_v2.decode([text for _, text in self.commands.channel_messages])
         self.assertEqual(result["data"], {"type": "error", "command": "radar", "error": 5})

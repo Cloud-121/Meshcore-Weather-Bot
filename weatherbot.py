@@ -103,6 +103,9 @@ class BotConfig:
     weather_channel_index: int
     weather_channel_name: str
     weather_channel_key: str
+    api_channel_index: int
+    api_channel_name: str
+    api_channel_key: str
     test_channel_index: int
     test_channel_name: str
     alert_zip_codes: list[str]
@@ -435,12 +438,15 @@ class WeatherBot:
             ),
             mesh.subscribe(EventType.MESSAGES_WAITING, drain_waiting),
         ]
-        if self.config.test_channel_index != self.config.weather_channel_index:
+        for channel_index in (
+            self.config.api_channel_index,
+            self.config.test_channel_index,
+        ):
             subscriptions.append(
                 mesh.subscribe(
                     EventType.CHANNEL_MSG_RECV,
                     handle_channel,
-                    attribute_filters={"channel_idx": self.config.test_channel_index},
+                    attribute_filters={"channel_idx": channel_index},
                 )
             )
         alert_task: Optional[asyncio.Task[Any]] = None
@@ -489,6 +495,17 @@ class WeatherBot:
                     EventType.OK,
                     "configuring #Weather",
                 )
+            if self.config.api_channel_key:
+                secret = decode_channel_key(self.config.api_channel_key)
+                self._require_event(
+                    await mesh.commands.set_channel(
+                        self.config.api_channel_index,
+                        self.config.api_channel_name,
+                        secret,
+                    ),
+                    EventType.OK,
+                    "configuring the API channel",
+                )
 
             channel = self._require_event(
                 await mesh.commands.get_channel(self.config.weather_channel_index),
@@ -501,6 +518,19 @@ class WeatherBot:
                 raise MeshError(
                     f"channel {self.config.weather_channel_index} is "
                     f"{actual or 'unconfigured'!r}, not {expected!r}"
+                )
+
+            api_channel = self._require_event(
+                await mesh.commands.get_channel(self.config.api_channel_index),
+                EventType.CHANNEL_INFO,
+                "reading the API channel",
+            )
+            actual_api = str(api_channel.payload.get("channel_name") or "").lstrip("#")
+            expected_api = self.config.api_channel_name.lstrip("#")
+            if actual_api.casefold() != expected_api.casefold():
+                raise MeshError(
+                    f"channel {self.config.api_channel_index} is "
+                    f"{actual_api or 'unconfigured'!r}, not {expected_api!r}"
                 )
 
             test_channel = self._require_event(
@@ -529,7 +559,7 @@ class WeatherBot:
                     "advertising the bot",
                 )
                 self._advertised = True
-        LOG.info("Weather bot is ready on #%s", actual)
+        LOG.info("Weather bot is ready on #%s; API channel #%s", actual, actual_api)
 
     def _remember_raw_channel_path(
         self, sender_timestamp: int, text: str, path: str, path_hash_mode: int
@@ -666,19 +696,20 @@ class WeatherBot:
     async def handle_message(self, mesh: Any, message: InboundMessage) -> bool:
         if message.is_channel and message.channel_index not in (
             self.config.weather_channel_index,
+            self.config.api_channel_index,
             self.config.test_channel_index,
         ):
             return False
         command = command_text(message.text, message.is_channel)
         # Explicit opt-in only; the original message remains the deduplication key.
         if re.search(r"\s+api2\s*$", command, re.IGNORECASE):
+            if message.is_channel and message.channel_index != self.config.api_channel_index:
+                return False
             command = re.sub(r"\s+api2\s*$", "", command, flags=re.IGNORECASE).strip()
             message = replace(message, api_version=2)
             if re.fullmatch(r"ping", command, re.IGNORECASE):
                 command = "ping json"
             else:
-                if message.is_channel and message.channel_index != self.config.weather_channel_index:
-                    return False
                 if re.fullmatch(r"bot|wx\s+help", command, re.IGNORECASE):
                     await self._reply_v2(mesh, message, {
                         "type": "discovery", "cmd": 255,
@@ -722,8 +753,14 @@ class WeatherBot:
                 command += " json"
         ping_match = PING_COMMAND.fullmatch(command)
         if ping_match:
-            if message.is_channel and message.channel_index != self.config.test_channel_index:
-                return False
+            if message.is_channel:
+                expected_channel = (
+                    self.config.api_channel_index
+                    if message.api_version == 2
+                    else self.config.test_channel_index
+                )
+                if message.channel_index != expected_channel:
+                    return False
             response: str | dict[str, Any] = (
                 ping_response_data(message)
                 if ping_match.group(1)
@@ -732,12 +769,42 @@ class WeatherBot:
             await self._reply(mesh, message, response)
             return True
 
-        if message.is_channel and message.channel_index != self.config.weather_channel_index:
-            return False
         bot_api_match = BOT_API_COMMAND.fullmatch(command)
         if bot_api_match:
+            if message.is_channel and message.channel_index != self.config.api_channel_index:
+                return False
             await self._reply_api(mesh, message, api_discovery_parts())
             return True
+
+        all_api_match = WX_ALL_API_COMMAND.fullmatch(command)
+        if all_api_match:
+            if message.is_channel and message.channel_index != self.config.api_channel_index:
+                return False
+            zip_code = all_api_match.group(1)
+            request_key = self._request_key(message)
+            if request_key is not None:
+                if self._is_seen(request_key):
+                    LOG.info("Ignoring duplicate API weather request for %s", zip_code)
+                    return True
+                self._note_seen(request_key)
+            try:
+                await self._reply_api(mesh, message, api_weather_parts(await self.weather.weather_api_all(zip_code)))
+            except WeatherError as exc:
+                await self._reply_api(
+                    mesh,
+                    message,
+                    [{"k": "e", "c": 1, "z": zip_code, "e": api_error_code(exc)}],
+                )
+            return True
+
+        if message.is_channel:
+            expected_channel = (
+                self.config.api_channel_index
+                if message.api_version == 2
+                else self.config.weather_channel_index
+            )
+            if message.channel_index != expected_channel:
+                return False
         help_match = WX_HELP_COMMAND.fullmatch(command)
         if help_match:
             response: str | dict[str, Any] = (
@@ -803,25 +870,6 @@ class WeatherBot:
                     else f"WX reports enabled for {zip_code}. {REPORT_STOP_TEXT}"
                 )
             await self._reply(mesh, message, reply)
-            return True
-
-        all_api_match = WX_ALL_API_COMMAND.fullmatch(command)
-        if all_api_match:
-            zip_code = all_api_match.group(1)
-            request_key = self._request_key(message)
-            if request_key is not None:
-                if self._is_seen(request_key):
-                    LOG.info("Ignoring duplicate API weather request for %s", zip_code)
-                    return True
-                self._note_seen(request_key)
-            try:
-                await self._reply_api(mesh, message, api_weather_parts(await self.weather.weather_api_all(zip_code)))
-            except WeatherError as exc:
-                await self._reply_api(
-                    mesh,
-                    message,
-                    [{"k": "e", "c": 1, "z": zip_code, "e": api_error_code(exc)}],
-                )
             return True
 
         request = parse_wx_request(command)
@@ -1862,6 +1910,9 @@ def load_config(path: Path) -> BotConfig:
         weather_channel_index=int(raw.get("weather_channel_index", 1)),
         weather_channel_name=str(raw.get("weather_channel_name", "Weather")).lstrip("#"),
         weather_channel_key=str(raw.get("weather_channel_key", "")),
+        api_channel_index=int(raw.get("api_channel_index", 3)),
+        api_channel_name=str(raw.get("api_channel_name", "wx-bot-hidden")).lstrip("#"),
+        api_channel_key=str(raw.get("api_channel_key", "")),
         test_channel_index=int(raw.get("test_channel_index", 2)),
         test_channel_name=str(raw.get("test_channel_name", "test")).lstrip("#"),
         alert_zip_codes=list(dict.fromkeys(zip_codes)),
@@ -1882,12 +1933,17 @@ def load_config(path: Path) -> BotConfig:
         raise SystemExit("weather_channel_index must be between 0 and 39")
     if not config.weather_channel_name:
         raise SystemExit("weather_channel_name cannot be empty")
+    if not 0 <= config.api_channel_index <= 39:
+        raise SystemExit("api_channel_index must be between 0 and 39")
+    if not config.api_channel_name:
+        raise SystemExit("api_channel_name cannot be empty")
     if not 0 <= config.test_channel_index <= 39:
         raise SystemExit("test_channel_index must be between 0 and 39")
     if not config.test_channel_name:
         raise SystemExit("test_channel_name cannot be empty")
-    if config.test_channel_index == config.weather_channel_index:
-        raise SystemExit("test_channel_index must differ from weather_channel_index")
+    if len({config.weather_channel_index, config.api_channel_index,
+            config.test_channel_index}) != 3:
+        raise SystemExit("weather, API, and test channel indexes must differ")
     if not config.bot_name or len(config.bot_name.encode("utf-8")) > 31:
         raise SystemExit("bot_name must be 1-31 UTF-8 bytes")
     if config.alert_poll_seconds < 30:
@@ -1907,6 +1963,11 @@ def load_config(path: Path) -> BotConfig:
     if config.weather_channel_key:
         try:
             decode_channel_key(config.weather_channel_key)
+        except MeshError as exc:
+            raise SystemExit(str(exc)) from exc
+    if config.api_channel_key:
+        try:
+            decode_channel_key(config.api_channel_key)
         except MeshError as exc:
             raise SystemExit(str(exc)) from exc
     return config

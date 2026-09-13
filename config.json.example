@@ -7,6 +7,10 @@
   "weather_channel_name": "Weather",
   "weather_channel_key": "",
 
+  "api_channel_index": 3,
+  "api_channel_name": "wx-bot-hidden",
+  "api_channel_key": "",
+
   "test_channel_index": 2,
   "test_channel_name": "test",
 
