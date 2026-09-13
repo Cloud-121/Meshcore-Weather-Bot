@@ -82,10 +82,54 @@ def _quantize_reflectivity(value: Any) -> int:
     return 6
 
 
+def _regular_grid_values(handle: Any, latitudes: list[float],
+                         longitudes: list[float]) -> list[float]:
+    """Sample a row-major lat/lon grid with one packed-data extraction.
+
+    MRMS uses PNG packing: ecCodes' nearest-point API unpacks the whole
+    CONUS field repeatedly. Compute the four surrounding grid points here,
+    select by spherical distance, then ask ecCodes for all values at once.
+    """
+    from eccodes import codes_get, codes_get_elements
+
+    ni, nj = codes_get(handle, "Ni"), codes_get(handle, "Nj")
+    lat0 = codes_get(handle, "latitudeOfFirstGridPointInDegrees")
+    lon0 = codes_get(handle, "longitudeOfFirstGridPointInDegrees")
+    di = codes_get(handle, "iDirectionIncrementInDegrees")
+    dj = codes_get(handle, "jDirectionIncrementInDegrees")
+    if codes_get(handle, "iScansNegatively"):
+        di = -di
+    if not codes_get(handle, "jScansPositively"):
+        dj = -dj
+    if ni < 2 or nj < 2 or not di or not dj:
+        raise ValueError("invalid radar grid geometry")
+
+    indexes = []
+    for lat, lon in zip(latitudes, longitudes, strict=True):
+        # Longitude encodings may use either -180..180 or 0..360.
+        delta_lon = (lon - lon0) % 360 if di > 0 else -((lon0 - lon) % 360)
+        x, y = delta_lon / di, (lat - lat0) / dj
+        if not -1e-6 <= x <= ni - 1 + 1e-6 or not -1e-6 <= y <= nj - 1 + 1e-6:
+            raise ValueError("sample point is outside radar grid")
+        x, y = max(0, min(ni - 1, x)), max(0, min(nj - 1, y))
+        candidates = []
+        for row in {math.floor(y), math.ceil(y)}:
+            grid_lat = math.radians(lat0 + row * dj)
+            for col in {math.floor(x), math.ceil(x)}:
+                dlat = grid_lat - math.radians(lat)
+                dlon = math.radians(lon0 + col * di - lon)
+                distance = (math.sin(dlat / 2) ** 2
+                            + math.cos(math.radians(lat)) * math.cos(grid_lat)
+                            * math.sin(dlon / 2) ** 2)
+                candidates.append((distance, row * ni + col))
+        indexes.append(min(candidates)[1])
+    return list(codes_get_elements(handle, "values", indexes))
+
+
 def _decode_grib(content: bytes, compressed: bool, latitudes: list[float],
                  longitudes: list[float]) -> list[int]:
     try:
-        from eccodes import (codes_grib_find_nearest_multiple,
+        from eccodes import (codes_get, codes_grib_find_nearest_multiple,
                              codes_grib_new_from_file, codes_release)
     except ImportError as exc:
         raise RadarError("radar decoder is not installed") from exc
@@ -98,6 +142,11 @@ def _decode_grib(content: bytes, compressed: bool, latitudes: list[float],
             if handle is None:
                 raise ValueError("no GRIB field")
             try:
+                if (codes_get(handle, "gridType") == "regular_ll"
+                        and not codes_get(handle, "jPointsAreConsecutive")
+                        and not codes_get(handle, "alternativeRowScanning")):
+                    values = _regular_grid_values(handle, latitudes, longitudes)
+                    return [_quantize_reflectivity(value) for value in values]
                 nearest = codes_grib_find_nearest_multiple(
                     handle, False, latitudes, longitudes
                 )
