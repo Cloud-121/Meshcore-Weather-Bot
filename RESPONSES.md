@@ -68,11 +68,12 @@ Please run wx report ZIPCODE or wx report stop in a DM.
 ## `ping`
 
 ```text
-@<user> 🏓 Pong
+@[<user>] 🏓 Pong
 Received: <UTC time, HH:MM:SS.mmm>
 Path: <raw route hashes, hop count, or unavailable>
 Region: <resolved MeshCore region, when supplied>
 Hops: <hop count, when known>
+Message Type: <Flood, Direct, TC Flood, or TC Direct when RF-log verified>
 Approx. direct distance: <miles> mi
 ```
 
@@ -82,6 +83,8 @@ For `#test`, raw hashes are uppercase and dash-separated (for example, `AF-2B-8A
 `AF2B-8A10`); unmatched packets and DMs fall back to hop count.
 The region line is included only when the companion supplies an already-resolved region
 name; this bot does not attempt to reverse-map MeshCore transport codes.
+The message-type line is shown only for a channel packet that exactly matches an RF-log
+entry; DMs and unmatched channel packets omit it.
 
 ## NWS alert notification
 

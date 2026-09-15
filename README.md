@@ -38,7 +38,7 @@ Use `wx report ZIPCODE` in a DM to subscribe that identity to NOAA alerts for a 
 repeat it to add more ZIPs. Every report alert is sent by DM and ends with
 `wx report stop`, which removes all of that identity's subscriptions. In `#Weather`,
 the report command tells the user to use a DM instead. `ping` works in a DM or in
-`#test`, returning an `@user` pong, millisecond UTC receipt time, separate route and
+`#test`, returning an `@[user]` pong, millisecond UTC receipt time, separate route and
 hop-count data, and the best route data the companion provides. For `#test` packets the
 bot shows raw route hashes when the companion's RF
 log includes a matching packet (for example, `AF-2B-8A` or `AF2B-8A10`); otherwise it

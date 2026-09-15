@@ -586,7 +586,7 @@ class MeshAdapterTests(unittest.IsolatedAsyncioTestCase):
             bot = weatherbot.WeatherBot(
                 make_config(Path(directory) / "state.json"), weather=FakeBriefWeather()
             )
-            bot._remember_raw_channel_path(100, "ping", "af2b8a10", 1)
+            bot._remember_raw_channel_path(100, "ping", "af2b8a10", 1, "FLOOD")
             matched = bot._attach_raw_channel_path(
                 weatherbot.InboundMessage(
                     "Alice: ping",
@@ -606,6 +606,7 @@ class MeshAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(matched.path, "af2b8a10")
         self.assertEqual(matched.path_hash_mode, 1)
+        self.assertEqual(matched.message_type, "FLOOD")
         self.assertIsNone(unmatched.path)
         self.assertEqual(weatherbot.route_description(unmatched), "2 hops")
 
@@ -818,7 +819,7 @@ class CommandFeatureTests(unittest.IsolatedAsyncioTestCase):
                 weatherbot.InboundMessage("ping", sender_prefix="aabbccddeeff"),
             )
         self.assertEqual(named_message.sender_name, "Scarlett")
-        self.assertEqual(weatherbot.requester_mention(named_message), "@Scarlett")
+        self.assertEqual(weatherbot.requester_mention(named_message), "@[Scarlett]")
         message = weatherbot.InboundMessage(
             "Alice: ping",
             channel_index=2,
@@ -828,7 +829,7 @@ class CommandFeatureTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             weatherbot.format_ping_response(message),
-            "@Alice 🏓 Pong\n"
+            "@[Alice] 🏓 Pong\n"
             "Received: 12:00:00.000 UTC\n"
             "Path: AA-BB-CC-DD\n"
             "Hops: 4",
@@ -844,26 +845,30 @@ class CommandFeatureTests(unittest.IsolatedAsyncioTestCase):
                     sender_name="Alice",
                     path_len=3,
                     region="us-gulf",
+                    message_type="TC_FLOOD",
                     received_at=weatherbot.datetime(
                         2026, 8, 24, 12, 0, 5, 525000,
                         tzinfo=weatherbot.ZoneInfo("UTC"),
                     ),
                 )
             ),
-            "@Alice 🏓 Pong\n"
+            "@[Alice] 🏓 Pong\n"
             "Received: 12:00:05.525 UTC\n"
             "Path: 3 hops\n"
             "Region: us-gulf\n"
-            "Hops: 3",
+            "Hops: 3\n"
+            "Message Type: TC Flood",
         )
         self.assertEqual(
             weatherbot.requester_mention(
                 weatherbot.InboundMessage("ping", sender_prefix="aabbccddeeff")
             ),
-            "@aabbccddeeff",
+            "@[aabbccddeeff]",
         )
         self.assertEqual(weatherbot.region_or_none({"region_name": " us-gulf "}), "us-gulf")
         self.assertIsNone(weatherbot.region_or_none({"transport_code": "deadbeef"}))
+        self.assertEqual(weatherbot.route_type_or_none({"route_typename": "direct"}), "DIRECT")
+        self.assertIsNone(weatherbot.route_type_or_none({"route_typename": "unknown"}))
         distance_message = weatherbot.InboundMessage("ping", approx_direct_miles=12.34)
         self.assertEqual(
             weatherbot.format_ping_response(distance_message).splitlines()[-1],

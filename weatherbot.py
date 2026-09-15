@@ -80,6 +80,7 @@ class InboundMessage:
     api_version: int = 0
     sender_name: Optional[str] = None
     region: Optional[str] = None
+    message_type: Optional[str] = None
 
     @property
     def is_channel(self) -> bool:
@@ -317,7 +318,7 @@ class WeatherBot:
         self._advertised = False
         self._contacts: dict[str, dict[str, Any]] = {}
         self._bot_coordinates: Optional[tuple[float, float]] = None
-        self._raw_channel_paths: deque[tuple[float, int, str, str, int]] = deque(
+        self._raw_channel_paths: deque[tuple[float, int, str, str, int, Optional[str]]] = deque(
             maxlen=RAW_PATH_CACHE_LIMIT
         )
         self._mesh_lock = asyncio.Lock()
@@ -407,6 +408,7 @@ class WeatherBot:
                     path_len=integer_or_none(payload.get("path_len")),
                     path_hash_mode=integer_or_none(payload.get("path_hash_mode")),
                     region=region_or_none(payload),
+                    message_type=route_type_or_none(payload),
                     sender_timestamp=integer_or_none(payload.get("sender_timestamp")),
                     received_at=datetime.now(tz=ZoneInfo("UTC")),
                 )
@@ -422,7 +424,13 @@ class WeatherBot:
             hash_size = integer_or_none(payload.get("path_hash_size"))
             if not path or timestamp is None or not text or hash_size not in (1, 2, 3):
                 return
-            self._remember_raw_channel_path(timestamp, text, path, hash_size - 1)
+            self._remember_raw_channel_path(
+                timestamp,
+                text,
+                path,
+                hash_size - 1,
+                route_type_or_none(payload),
+            )
 
         async def drain_waiting(_event: Any) -> None:
             try:
@@ -566,7 +574,12 @@ class WeatherBot:
         LOG.info("Weather bot is ready on #%s; API channel #%s", actual, actual_api)
 
     def _remember_raw_channel_path(
-        self, sender_timestamp: int, text: str, path: str, path_hash_mode: int
+        self,
+        sender_timestamp: int,
+        text: str,
+        path: str,
+        path_hash_mode: int,
+        message_type: Optional[str] = None,
     ) -> None:
         now = time.monotonic()
         self._raw_channel_paths = deque(
@@ -574,7 +587,14 @@ class WeatherBot:
             maxlen=RAW_PATH_CACHE_LIMIT,
         )
         self._raw_channel_paths.append(
-            (now, sender_timestamp, command_text(text, True), path, path_hash_mode)
+            (
+                now,
+                sender_timestamp,
+                command_text(text, True),
+                path,
+                path_hash_mode,
+                message_type,
+            )
         )
 
     def _attach_raw_channel_path(self, message: InboundMessage) -> InboundMessage:
@@ -586,20 +606,29 @@ class WeatherBot:
             return message
         now = time.monotonic()
         wanted_text = command_text(message.text, True)
-        retained: deque[tuple[float, int, str, str, int]] = deque(
+        retained: deque[tuple[float, int, str, str, int, Optional[str]]] = deque(
             maxlen=RAW_PATH_CACHE_LIMIT
         )
-        match: Optional[tuple[str, int]] = None
+        match: Optional[tuple[str, int, Optional[str]]] = None
         while self._raw_channel_paths:
-            received, timestamp, text, path, mode = self._raw_channel_paths.popleft()
+            received, timestamp, text, path, mode, message_type = self._raw_channel_paths.popleft()
             if received < now - RAW_PATH_CACHE_SECONDS:
                 continue
             if match is None and timestamp == message.sender_timestamp and text == wanted_text:
-                match = (path, mode)
+                match = (path, mode, message_type)
                 continue
-            retained.append((received, timestamp, text, path, mode))
+            retained.append((received, timestamp, text, path, mode, message_type))
         self._raw_channel_paths = retained
-        return replace(message, path=match[0], path_hash_mode=match[1]) if match else message
+        return (
+            replace(
+                message,
+                path=match[0],
+                path_hash_mode=match[1],
+                message_type=match[2] or message.message_type,
+            )
+            if match
+            else message
+        )
 
     def _direct_distance_miles(self, message: InboundMessage) -> Optional[float]:
         if not message.sender_prefix or self._bot_coordinates is None:
@@ -1358,6 +1387,14 @@ def region_or_none(payload: Any) -> Optional[str]:
     return None
 
 
+def route_type_or_none(payload: Any) -> Optional[str]:
+    """Return a verified MeshCore RF route type when an event supplies one."""
+    if not isinstance(payload, dict):
+        return None
+    value = str(payload.get("route_typename") or "").upper()
+    return value if value in {"FLOOD", "DIRECT", "TC_FLOOD", "TC_DIRECT"} else None
+
+
 def coordinates_or_none(data: dict[str, Any]) -> Optional[tuple[float, float]]:
     """Return usable advertised coordinates, treating the default as unavailable."""
     try:
@@ -1416,13 +1453,24 @@ def hop_count(message: InboundMessage) -> Optional[int]:
 
 
 def requester_mention(message: InboundMessage) -> str:
-    """Return a display-only requester label for a human pong response."""
+    """Return a MeshCore client-recognized requester mention."""
     name = message.sender_name
     if message.is_channel and ": " in message.text:
         name = message.text.split(": ", 1)[0]
     if not name and message.sender_prefix:
         name = message.sender_prefix[:12]
-    return "@" + (" ".join((name or "user").split()))
+    name = " ".join((name or "user").strip("[]").split())
+    return f"@[{name}]"
+
+
+def message_type_label(message: InboundMessage) -> Optional[str]:
+    """Return the human label for a verified MeshCore RF route type."""
+    return {
+        "FLOOD": "Flood",
+        "DIRECT": "Direct",
+        "TC_FLOOD": "TC Flood",
+        "TC_DIRECT": "TC Direct",
+    }.get(message.message_type or "")
 
 
 def ping_response_data(message: InboundMessage) -> dict[str, Any]:
@@ -1451,6 +1499,9 @@ def format_ping_response(message: InboundMessage) -> str:
     count = hop_count(message)
     if count is not None:
         response += f"\nHops: {count}"
+    message_type = message_type_label(message)
+    if message_type:
+        response += f"\nMessage Type: {message_type}"
     if "approx_direct_miles" in data:
         response += f"\nApprox. direct distance: {data['approx_direct_miles']:.1f} mi"
     return response
