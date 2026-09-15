@@ -78,6 +78,8 @@ class InboundMessage:
     approx_direct_miles: Optional[float] = None
     received_at: Optional[datetime] = None
     api_version: int = 0
+    sender_name: Optional[str] = None
+    region: Optional[str] = None
 
     @property
     def is_channel(self) -> bool:
@@ -387,6 +389,7 @@ class WeatherBot:
                     path=str(payload.get("path") or "") or None,
                     path_len=integer_or_none(payload.get("path_len")),
                     path_hash_mode=integer_or_none(payload.get("path_hash_mode")),
+                    region=region_or_none(payload),
                     sender_timestamp=integer_or_none(payload.get("sender_timestamp")),
                     received_at=datetime.now(tz=ZoneInfo("UTC")),
                 )
@@ -403,6 +406,7 @@ class WeatherBot:
                     path=str(payload.get("path") or "") or None,
                     path_len=integer_or_none(payload.get("path_len")),
                     path_hash_mode=integer_or_none(payload.get("path_hash_mode")),
+                    region=region_or_none(payload),
                     sender_timestamp=integer_or_none(payload.get("sender_timestamp")),
                     received_at=datetime.now(tz=ZoneInfo("UTC")),
                 )
@@ -761,11 +765,11 @@ class WeatherBot:
                 )
                 if message.channel_index != expected_channel:
                     return False
-            response: str | dict[str, Any] = (
-                ping_response_data(message)
-                if ping_match.group(1)
-                else format_ping_response(message)
-            )
+            if ping_match.group(1):
+                response: str | dict[str, Any] = ping_response_data(message)
+            else:
+                message = await self._with_ping_sender_name(mesh, message)
+                response = format_ping_response(message)
             await self._reply(mesh, message, response)
             return True
 
@@ -946,6 +950,18 @@ class WeatherBot:
         for chunk in chunks:
             LOG.debug("Sending DM chunk (%d bytes) to %s", len(chunk.encode("utf-8")), message.sender_prefix[:12])
             await self.send_dm_with_fallback(mesh, message.sender_prefix, chunk)
+
+    async def _with_ping_sender_name(
+        self, mesh: Any, message: InboundMessage
+    ) -> InboundMessage:
+        """Attach a DM sender's advertised name when the companion knows it."""
+        if message.is_channel or not message.sender_prefix:
+            return message
+        contact = await self._find_contact_unlocked(mesh, message.sender_prefix)
+        if contact is None:
+            return message
+        name = str(contact.get("adv_name") or "").strip()
+        return replace(message, sender_name=name or None)
 
     async def _reply_v2(self, mesh: Any, message: InboundMessage, data: dict[str, Any]) -> None:
         flood_warning = False
@@ -1331,6 +1347,17 @@ def integer_or_none(value: Any) -> Optional[int]:
         return None
 
 
+def region_or_none(payload: Any) -> Optional[str]:
+    """Return an already-resolved MeshCore region name, if supplied by a companion."""
+    if not isinstance(payload, dict):
+        return None
+    for key in ("region", "region_name"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 def coordinates_or_none(data: dict[str, Any]) -> Optional[tuple[float, float]]:
     """Return usable advertised coordinates, treating the default as unavailable."""
     try:
@@ -1375,6 +1402,29 @@ def route_description(message: InboundMessage) -> str:
     return "unavailable"
 
 
+def hop_count(message: InboundMessage) -> Optional[int]:
+    """Return a trustworthy received hop count, when the companion supplied one."""
+    if message.path_len is not None and 0 <= message.path_len != 255:
+        return message.path_len
+    if not message.path:
+        return None
+    hash_size = (message.path_hash_mode or 0) + 1
+    hash_width = hash_size * 2
+    if hash_size <= 0 or len(message.path) % hash_width:
+        return None
+    return len(message.path) // hash_width
+
+
+def requester_mention(message: InboundMessage) -> str:
+    """Return a display-only requester label for a human pong response."""
+    name = message.sender_name
+    if message.is_channel and ": " in message.text:
+        name = message.text.split(": ", 1)[0]
+    if not name and message.sender_prefix:
+        name = message.sender_prefix[:12]
+    return "@" + (" ".join((name or "user").split()))
+
+
 def ping_response_data(message: InboundMessage) -> dict[str, Any]:
     received = message.received_at or datetime.now(tz=ZoneInfo("UTC"))
     data: dict[str, Any] = {
@@ -1389,7 +1439,18 @@ def ping_response_data(message: InboundMessage) -> dict[str, Any]:
 
 def format_ping_response(message: InboundMessage) -> str:
     data = ping_response_data(message)
-    response = f"🏓 Pong\nReceived: {data['received_at']}\nPath: {data['path']}"
+    received = message.received_at or datetime.now(tz=ZoneInfo("UTC"))
+    received_time = received.astimezone(ZoneInfo("UTC")).strftime("%H:%M:%S.%f")[:12]
+    response = (
+        f"{requester_mention(message)} 🏓 Pong\n"
+        f"Received: {received_time} UTC\n"
+        f"Path: {data['path']}"
+    )
+    if message.region:
+        response += f"\nRegion: {message.region}"
+    count = hop_count(message)
+    if count is not None:
+        response += f"\nHops: {count}"
     if "approx_direct_miles" in data:
         response += f"\nApprox. direct distance: {data['approx_direct_miles']:.1f} mi"
     return response

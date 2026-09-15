@@ -805,8 +805,22 @@ class CommandFeatureTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(commands.attempts), sent)
 
     async def test_ping_and_json_helpers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot = weatherbot.WeatherBot(
+                make_config(Path(directory) / "state.json"), weather=FakeBriefWeather()
+            )
+            bot._contacts["aabbccddeeff"] = {
+                "public_key": "aabbccddeeff" + "00" * 26,
+                "adv_name": "Scarlett",
+            }
+            named_message = await bot._with_ping_sender_name(
+                FakeMesh(FakeRoutingCommands()),
+                weatherbot.InboundMessage("ping", sender_prefix="aabbccddeeff"),
+            )
+        self.assertEqual(named_message.sender_name, "Scarlett")
+        self.assertEqual(weatherbot.requester_mention(named_message), "@Scarlett")
         message = weatherbot.InboundMessage(
-            "ping",
+            "Alice: ping",
             channel_index=2,
             path="aabbccdd",
             path_hash_mode=0,
@@ -814,12 +828,42 @@ class CommandFeatureTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             weatherbot.format_ping_response(message),
-            "🏓 Pong\n"
-            "Received: 2026-08-24T12:00:00+00:00\n"
-            "Path: AA-BB-CC-DD",
+            "@Alice 🏓 Pong\n"
+            "Received: 12:00:00.000 UTC\n"
+            "Path: AA-BB-CC-DD\n"
+            "Hops: 4",
         )
         wide_path = weatherbot.InboundMessage("ping", path="af2b8a10", path_hash_mode=1)
         self.assertEqual(weatherbot.route_description(wide_path), "AF2B-8A10")
+        self.assertEqual(weatherbot.hop_count(wide_path), 2)
+        self.assertEqual(
+            weatherbot.format_ping_response(
+                weatherbot.InboundMessage(
+                    "ping",
+                    sender_prefix="aabbccddeeff",
+                    sender_name="Alice",
+                    path_len=3,
+                    region="us-gulf",
+                    received_at=weatherbot.datetime(
+                        2026, 8, 24, 12, 0, 5, 525000,
+                        tzinfo=weatherbot.ZoneInfo("UTC"),
+                    ),
+                )
+            ),
+            "@Alice 🏓 Pong\n"
+            "Received: 12:00:05.525 UTC\n"
+            "Path: 3 hops\n"
+            "Region: us-gulf\n"
+            "Hops: 3",
+        )
+        self.assertEqual(
+            weatherbot.requester_mention(
+                weatherbot.InboundMessage("ping", sender_prefix="aabbccddeeff")
+            ),
+            "@aabbccddeeff",
+        )
+        self.assertEqual(weatherbot.region_or_none({"region_name": " us-gulf "}), "us-gulf")
+        self.assertIsNone(weatherbot.region_or_none({"transport_code": "deadbeef"}))
         distance_message = weatherbot.InboundMessage("ping", approx_direct_miles=12.34)
         self.assertEqual(
             weatherbot.format_ping_response(distance_message).splitlines()[-1],

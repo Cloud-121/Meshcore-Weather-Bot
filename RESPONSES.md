@@ -68,9 +68,11 @@ Please run wx report ZIPCODE or wx report stop in a DM.
 ## `ping`
 
 ```text
-🏓 Pong
-Received: <UTC ISO-8601 time>
+@<user> 🏓 Pong
+Received: <UTC time, HH:MM:SS.mmm>
 Path: <raw route hashes, hop count, or unavailable>
+Region: <resolved MeshCore region, when supplied>
+Hops: <hop count, when known>
 Approx. direct distance: <miles> mi
 ```
 
@@ -78,6 +80,8 @@ The distance line is present only when the bot and a DM sender have advertised G
 coordinates. It is straight-line endpoint distance, not the distance through relays.
 For `#test`, raw hashes are uppercase and dash-separated (for example, `AF-2B-8A` or
 `AF2B-8A10`); unmatched packets and DMs fall back to hop count.
+The region line is included only when the companion supplies an already-resolved region
+name; this bot does not attempt to reverse-map MeshCore transport codes.
 
 ## NWS alert notification
 

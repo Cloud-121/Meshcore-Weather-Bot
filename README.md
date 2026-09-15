@@ -38,14 +38,17 @@ Use `wx report ZIPCODE` in a DM to subscribe that identity to NOAA alerts for a 
 repeat it to add more ZIPs. Every report alert is sent by DM and ends with
 `wx report stop`, which removes all of that identity's subscriptions. In `#Weather`,
 the report command tells the user to use a DM instead. `ping` works in a DM or in
-`#test`, returning `pong`, the bot receipt time, and the best route data the companion
-provides. For `#test` packets the bot shows raw route hashes when the companion's RF
+`#test`, returning an `@user` pong, millisecond UTC receipt time, separate route and
+hop-count data, and the best route data the companion provides. For `#test` packets the
+bot shows raw route hashes when the companion's RF
 log includes a matching packet (for example, `AF-2B-8A` or `AF2B-8A10`); otherwise it
 falls back to hop count. DM pings use the reliable hop-count fallback because their
 encrypted raw packets cannot be matched safely. When both the bot and a DM sender have
 advertised GPS coordinates, `ping` also shows their approximate straight-line distance;
 this is not the distance through relay nodes. `ping json` is also available for
-structured diagnostic output.
+structured diagnostic output. A human pong shows a region only when the companion has
+already supplied a resolved region name; it does not expose or reverse-map transport
+codes.
 
 Before a DM reply the bot
 refreshes the sender's route from its newest advert path (`get_advert_path`), then uses
