@@ -496,6 +496,18 @@ class WeatherBot:
                 EventType.OK,
                 "setting the bot name",
             )
+            self._require_event(
+                await mesh.commands.set_path_hash_mode(1),
+                EventType.OK,
+                "setting two-byte path hashes",
+            )
+            path_hash_mode = await mesh.commands.get_path_hash_mode()
+            if path_hash_mode != 1:
+                raise MeshError(
+                    "verifying two-byte path hashes failed: "
+                    f"companion reported mode {path_hash_mode!r}, expected 1"
+                )
+            LOG.info("Companion path hash mode set to 1 (two bytes per hop)")
             if self.config.weather_channel_key:
                 secret = decode_channel_key(self.config.weather_channel_key)
                 self._require_event(

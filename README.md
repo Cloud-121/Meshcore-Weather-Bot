@@ -97,6 +97,13 @@ empty when the channel is already stored by the repeater. Channel API and API v2
 requests are accepted only there; human-readable weather commands and alerts remain
 on `#Weather`. API requests in DMs are also supported.
 
+At startup the bot strictly configures its dedicated companion for two-byte MeshCore
+path hashes (`path_hash_mode` 1) and verifies the setting before advertising. This
+applies to bot-originated channel, flood, and direct messages, limits a flood path to
+32 hops, and requires every repeater carrying the traffic to run MeshCore firmware
+1.14 or newer. Startup fails instead of silently falling back to one-byte paths when
+the companion does not support or retain the setting.
+
 Also configure `test_channel_index` as `test` (or set both matching values in
 `config.json`). The bot verifies that channel at startup and uses it only for public
 `ping`; its encryption key must already be configured on the companion.

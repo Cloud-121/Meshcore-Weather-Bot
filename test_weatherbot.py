@@ -468,9 +468,11 @@ class RoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FakeSetupCommands:
-    def __init__(self):
+    def __init__(self, path_hash_set_event=None, path_hash_mode=1):
         self.calls = []
         self.channel_messages = []
+        self.path_hash_set_event = path_hash_set_event or FakeEvent(EventType.OK)
+        self.path_hash_mode = path_hash_mode
         self.contact = {
             "public_key": "aabbccddeeff" + "00" * 26,
             "adv_name": "Alice",
@@ -480,6 +482,14 @@ class FakeSetupCommands:
     async def set_name(self, name):
         self.calls.append(("set_name", name))
         return FakeEvent(EventType.OK)
+
+    async def set_path_hash_mode(self, mode):
+        self.calls.append(("set_path_hash_mode", mode))
+        return self.path_hash_set_event
+
+    async def get_path_hash_mode(self):
+        self.calls.append(("get_path_hash_mode",))
+        return self.path_hash_mode
 
     async def send_appstart(self):
         self.calls.append(("send_appstart",))
@@ -661,9 +671,45 @@ class MeshAdapterTests(unittest.IsolatedAsyncioTestCase):
             await bot._prepare_mesh(mesh)
         self.assertIn(("set_channel", 1, "Weather", key), commands.calls)
         self.assertIn(("set_channel", 3, "wx-bot-hidden", key[::-1]), commands.calls)
+        self.assertIn(("set_path_hash_mode", 1), commands.calls)
+        self.assertIn(("get_path_hash_mode",), commands.calls)
         self.assertIn(("send_advert", True), commands.calls)
+        self.assertLess(
+            commands.calls.index(("get_path_hash_mode",)),
+            commands.calls.index(("send_advert", True)),
+        )
         self.assertIn("aabbccddeeff", bot._contacts)
         self.assertTrue(mesh.decrypt_channel_logs)
+
+    async def test_setup_fails_when_two_byte_path_hash_mode_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot = weatherbot.WeatherBot(
+                make_config(Path(directory) / "state.json"), weather=FakeBriefWeather()
+            )
+            commands = FakeSetupCommands(
+                path_hash_set_event=FakeEvent(
+                    EventType.ERROR, {"reason": "unsupported"}
+                )
+            )
+            with self.assertRaisesRegex(
+                weatherbot.MeshError, "setting two-byte path hashes failed: unsupported"
+            ):
+                await bot._prepare_mesh(FakeMesh(commands))
+
+        self.assertNotIn(("send_advert", True), commands.calls)
+
+    async def test_setup_fails_when_two_byte_path_hash_mode_does_not_verify(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot = weatherbot.WeatherBot(
+                make_config(Path(directory) / "state.json"), weather=FakeBriefWeather()
+            )
+            commands = FakeSetupCommands(path_hash_mode=0)
+            with self.assertRaisesRegex(
+                weatherbot.MeshError, "companion reported mode 0, expected 1"
+            ):
+                await bot._prepare_mesh(FakeMesh(commands))
+
+        self.assertNotIn(("send_advert", True), commands.calls)
 
     async def test_channel_request_replies_to_weather_channel(self):
         with tempfile.TemporaryDirectory() as directory:
