@@ -166,7 +166,9 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.commands.channel_messages.clear()
             channel = 3 if command.endswith("api2") or command.endswith(" api") else 1
             self.assertTrue(await self.bot.handle_message(
-                self.mesh, weatherbot.InboundMessage(command, channel_index=channel)))
+                self.mesh, weatherbot.InboundMessage(
+                    command, channel_index=channel,
+                    required_region_match=True if channel == 1 else None)))
             self.assertEqual(len(self.commands.channel_messages), count)
             self.assertTrue(self.commands.channel_messages[0][1].startswith(prefix))
 

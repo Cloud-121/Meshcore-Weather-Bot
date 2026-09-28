@@ -8,6 +8,7 @@ import asyncio
 import base64
 import binascii
 import hashlib
+import hmac
 import json
 import logging
 import math
@@ -43,6 +44,11 @@ WX_REPORT_COMMAND = re.compile(
 PING_COMMAND = re.compile(r"\s*ping(?:\s+(json))?\s*", re.IGNORECASE)
 RAW_PATH_CACHE_SECONDS = 10.0
 RAW_PATH_CACHE_LIMIT = 128
+REGION_NOTICE = (
+    'Your messege didn\'t have the "us-msy" region code attached, October 1st; '
+    'The Gulf Coast Mesh will be switching this bot to only respond to "us-msy". '
+    'For more information please check our Discord or Facebook.'
+)
 HELP_TEXT = (
     "Gulf Coast Mesh Bot, Designed by ScarlettOSA\n"
     "wx ZIPCODE: weather report\n"
@@ -80,11 +86,24 @@ class InboundMessage:
     api_version: int = 0
     sender_name: Optional[str] = None
     region: Optional[str] = None
+    required_region_match: Optional[bool] = None
     message_type: Optional[str] = None
 
     @property
     def is_channel(self) -> bool:
         return self.channel_index is not None
+
+
+@dataclass(frozen=True)
+class RawChannelMetadata:
+    received: float
+    channel_index: int
+    timestamp: int
+    text: str
+    path: str
+    path_hash_mode: int
+    message_type: Optional[str]
+    required_region_match: Optional[bool]
 
 
 @dataclass(frozen=True)
@@ -318,7 +337,7 @@ class WeatherBot:
         self._advertised = False
         self._contacts: dict[str, dict[str, Any]] = {}
         self._bot_coordinates: Optional[tuple[float, float]] = None
-        self._raw_channel_paths: deque[tuple[float, int, str, str, int, Optional[str]]] = deque(
+        self._raw_channel_paths: deque[RawChannelMetadata] = deque(
             maxlen=RAW_PATH_CACHE_LIMIT
         )
         self._mesh_lock = asyncio.Lock()
@@ -368,6 +387,7 @@ class WeatherBot:
                 await self.radar.close()
 
     async def _serve_connection(self, mesh: Any) -> None:
+        self._raw_channel_paths.clear()
         disconnected = asyncio.Event()
 
         def remember_ack(event: Any) -> None:
@@ -415,22 +435,7 @@ class WeatherBot:
             await self._safe_handle_message(mesh, self._attach_raw_channel_path(message))
 
         async def remember_raw_channel_path(event: Any) -> None:
-            payload = event.payload or {}
-            if str(payload.get("chan_name") or "").lstrip("#").casefold() != self.config.test_channel_name.casefold():
-                return
-            path = str(payload.get("path") or "")
-            timestamp = integer_or_none(payload.get("sender_timestamp"))
-            text = str(payload.get("message") or "")
-            hash_size = integer_or_none(payload.get("path_hash_size"))
-            if not path or timestamp is None or not text or hash_size not in (1, 2, 3):
-                return
-            self._remember_raw_channel_path(
-                timestamp,
-                text,
-                path,
-                hash_size - 1,
-                route_type_or_none(payload),
-            )
+            self._remember_raw_channel_event(event.payload or {})
 
         async def drain_waiting(_event: Any) -> None:
             try:
@@ -572,7 +577,7 @@ class WeatherBot:
 
             # MeshCore otherwise keeps RF logs encrypted and exposes only the
             # companion's hop count.  With the verified channel keys loaded,
-            # it can correlate a raw #test packet with its delivered message.
+            # it can correlate raw channel packets with delivered messages.
             mesh.set_decrypt_channel_logs(True)
 
             await self._refresh_contacts_unlocked(mesh)
@@ -585,6 +590,28 @@ class WeatherBot:
                 self._advertised = True
         LOG.info("Weather bot is ready on #%s; API channel #%s", actual, actual_api)
 
+    def _remember_raw_channel_event(self, payload: Any) -> None:
+        if not isinstance(payload, dict):
+            return
+        name = str(payload.get("chan_name") or "").lstrip("#").casefold()
+        channels = {
+            self.config.weather_channel_name.casefold(): self.config.weather_channel_index,
+            self.config.test_channel_name.casefold(): self.config.test_channel_index,
+        }
+        index = channels.get(name)
+        timestamp = integer_or_none(payload.get("sender_timestamp"))
+        text = payload.get("message")
+        hash_size = integer_or_none(payload.get("path_hash_size"))
+        if index is None or timestamp is None or not isinstance(text, str) or not text:
+            return
+        if hash_size not in (1, 2, 3):
+            return
+        self._remember_raw_channel_path(
+            timestamp, text, str(payload.get("path") or ""), hash_size - 1,
+            route_type_or_none(payload), channel_index=index,
+            required_region_match=raw_region_match(payload),
+        )
+
     def _remember_raw_channel_path(
         self,
         sender_timestamp: int,
@@ -592,54 +619,50 @@ class WeatherBot:
         path: str,
         path_hash_mode: int,
         message_type: Optional[str] = None,
+        *,
+        channel_index: int,
+        required_region_match: Optional[bool] = None,
     ) -> None:
         now = time.monotonic()
         self._raw_channel_paths = deque(
-            (item for item in self._raw_channel_paths if item[0] >= now - RAW_PATH_CACHE_SECONDS),
+            (item for item in self._raw_channel_paths
+             if item.received >= now - RAW_PATH_CACHE_SECONDS),
             maxlen=RAW_PATH_CACHE_LIMIT,
         )
-        self._raw_channel_paths.append(
-            (
-                now,
-                sender_timestamp,
-                command_text(text, True),
-                path,
-                path_hash_mode,
-                message_type,
-            )
-        )
+        self._raw_channel_paths.append(RawChannelMetadata(
+            now, channel_index, sender_timestamp, text, path,
+            path_hash_mode, message_type, required_region_match,
+        ))
 
     def _attach_raw_channel_path(self, message: InboundMessage) -> InboundMessage:
-        """Attach only an exact #test raw-log match; DMs are never guessed."""
-        if (
-            message.channel_index != self.config.test_channel_index
-            or message.sender_timestamp is None
-        ):
+        """Match channel, timestamp and full sender-prefixed text; never guess DMs."""
+        if not message.is_channel or message.sender_timestamp is None:
             return message
         now = time.monotonic()
-        wanted_text = command_text(message.text, True)
-        retained: deque[tuple[float, int, str, str, int, Optional[str]]] = deque(
-            maxlen=RAW_PATH_CACHE_LIMIT
+        self._raw_channel_paths = deque(
+            (item for item in self._raw_channel_paths
+             if item.received >= now - RAW_PATH_CACHE_SECONDS),
+            maxlen=RAW_PATH_CACHE_LIMIT,
         )
-        match: Optional[tuple[str, int, Optional[str]]] = None
-        while self._raw_channel_paths:
-            received, timestamp, text, path, mode, message_type = self._raw_channel_paths.popleft()
-            if received < now - RAW_PATH_CACHE_SECONDS:
-                continue
-            if match is None and timestamp == message.sender_timestamp and text == wanted_text:
-                match = (path, mode, message_type)
-                continue
-            retained.append((received, timestamp, text, path, mode, message_type))
-        self._raw_channel_paths = retained
-        return (
-            replace(
-                message,
-                path=match[0],
-                path_hash_mode=match[1],
-                message_type=match[2] or message.message_type,
-            )
-            if match
-            else message
+        matches = [item for item in self._raw_channel_paths
+                   if item.channel_index == message.channel_index
+                   and item.timestamp == message.sender_timestamp
+                   and item.text == message.text]
+        if not matches:
+            return message
+        # Keep metadata for duplicate deliveries; conflicting observations are unknown.
+        match = matches[-1]
+        statuses = {item.required_region_match for item in matches}
+        status = match.required_region_match if len(statuses) == 1 else None
+        region = message.region
+        if status is not None:
+            region = "us-msy" if status else None
+        if len(statuses) > 1:
+            region = None
+        return replace(
+            message, path=match.path, path_hash_mode=match.path_hash_mode,
+            message_type=match.message_type or message.message_type,
+            required_region_match=status, region=region,
         )
 
     def _direct_distance_miles(self, message: InboundMessage) -> Optional[float]:
@@ -977,6 +1000,14 @@ class WeatherBot:
                     if isinstance(response, dict)
                     else f"{response}\n\n{UNKNOWN_SENDER_NOTICE}"
                 )
+        if (
+            isinstance(response, str)
+            and message.channel_index in (
+                self.config.weather_channel_index, self.config.test_channel_index
+            )
+            and not has_required_region(message)
+        ):
+            response += "\n\n" + REGION_NOTICE
         chunks = (
             split_mesh_json(response)
             if isinstance(response, dict)
@@ -1386,6 +1417,53 @@ def integer_or_none(value: Any) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def raw_region_match(payload: Any) -> Optional[bool]:
+    """Verify the first transport code as RegionMap::findMatch does in MeshCore.
+
+    RX_LOG_DATA.payload is the complete RF frame, not its decrypted text.
+    Unknown/malformed frames must not be confused with proven unscoped packets.
+    """
+    if not isinstance(payload, dict):
+        return None
+    raw = payload.get("payload")
+    try:
+        frame = bytes.fromhex(raw) if isinstance(raw, str) else raw
+        if not isinstance(frame, bytes) or len(frame) < 2:
+            return None
+        route = frame[0] & 3
+        payload_type = (frame[0] >> 2) & 15
+        if payload_type != 5 or frame[0] >> 6 != 0:
+            return None
+        scoped = route in (0, 3)
+        path_offset = 5 if scoped else 1
+        if len(frame) <= path_offset:
+            return None
+        path_byte = frame[path_offset]
+        hash_size = (path_byte >> 6) + 1
+        path_bytes = (path_byte & 63) * hash_size
+        if hash_size == 4 or path_bytes > 64:
+            return None
+        encrypted = frame[path_offset + 1 + path_bytes:]
+        # Channel hash, two-byte MAC, and AES blocks containing the message.
+        if len(encrypted) < 19 or (len(encrypted) - 3) % 16:
+            return None
+        if not scoped:
+            return False
+        key = hashlib.sha256(b"#us-msy").digest()[:16]
+        digest = hmac.digest(key, bytes([payload_type]) + encrypted, "sha256")
+        code = int.from_bytes(digest[:2], "little")
+        code = 1 if code == 0 else 65534 if code == 65535 else code
+        return frame[1:3] == code.to_bytes(2, "little")
+    except (ValueError, TypeError):
+        return None
+
+
+def has_required_region(message: InboundMessage) -> bool:
+    if message.required_region_match is not None:
+        return message.required_region_match
+    return (message.region or "").strip().removeprefix("#") == "us-msy"
 
 
 def region_or_none(payload: Any) -> Optional[str]:
