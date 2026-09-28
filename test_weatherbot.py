@@ -467,7 +467,7 @@ class RoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
             sent = list(commands.channel_messages)
             self.assertTrue(await bot.handle_message(mesh, message))
             self.assertEqual(commands.channel_messages, sent)
-            self.assertIn("Your messege", " ".join(text for _, text in sent))
+            self.assertIn('Missing "us-msy" region.', " ".join(text for _, text in sent))
 
 
 class FakeSetupCommands:
@@ -639,6 +639,10 @@ class RegionTests(unittest.IsolatedAsyncioTestCase):
                         body = " ".join(weatherbot.re.sub(r"^\[\d+/\d+\] ", "", text) for text in chunks)
                         self.assertIn(answer, body)
                         self.assertEqual(body.count(weatherbot.REGION_NOTICE), 0 if status is True else 1)
+                        self.assertEqual(
+                            sum(weatherbot.REGION_NOTICE in chunk for chunk in chunks),
+                            0 if status is True else 1,
+                        )
                         self.assertTrue(all(len(text.encode()) <= 140 for text in chunks))
             commands = FakeSetupCommands()
             self.assertFalse(await bot.handle_message(FakeMesh(commands), weatherbot.InboundMessage("Alice: hello", channel_index=1)))
@@ -647,7 +651,7 @@ class RegionTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await bot.handle_message(FakeMesh(commands), weatherbot.InboundMessage("wx 60601", channel_index=1)))
             body = " ".join(text for _, text in commands.channel_messages)
             self.assertIn("lookup failed: unavailable", body)
-            self.assertIn("Your messege", body)
+            self.assertIn('Missing "us-msy" region.', body)
 
     async def test_json_api_and_dm_exemptions(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -660,11 +664,11 @@ class RegionTests(unittest.IsolatedAsyncioTestCase):
                                      ("ping api2", 3)):
                 commands = FakeSetupCommands()
                 self.assertTrue(await bot.handle_message(FakeMesh(commands), weatherbot.InboundMessage(command, channel_index=channel)))
-                self.assertNotIn("Your messege", " ".join(text for _, text in commands.channel_messages))
+                self.assertNotIn('Missing "us-msy" region.', " ".join(text for _, text in commands.channel_messages))
             bot._has_contact = AsyncMock(return_value=True)
             bot.send_dm_with_fallback = AsyncMock()
             await bot.handle_message(object(), weatherbot.InboundMessage("wx help", sender_prefix="aabbccddeeff"))
-            self.assertNotIn("Your messege", " ".join(call.args[2] for call in bot.send_dm_with_fallback.call_args_list))
+            self.assertNotIn('Missing "us-msy" region.', " ".join(call.args[2] for call in bot.send_dm_with_fallback.call_args_list))
 
     def test_explicit_region_fallback_and_packet_precedence(self):
         for name in ("us-msy", "#us-msy", " us-msy "):

@@ -53,7 +53,7 @@ is unavailable.
 Human command replies in `#Weather` and `#test` include the following notice unless
 `us-msy` is verified. The requested answer is still sent normally:
 
-> Your messege didn't have the "us-msy" region code attached, October 1st; The Gulf Coast Mesh will be switching this bot to only respond to "us-msy". For more information please check our Discord or Facebook.
+> Missing "us-msy" region. From Oct 1, Gulf Coast Mesh bot will require "us-msy". See our Discord or Facebook for info.
 
 DMs, all JSON/API commands, and scheduled alerts are exempt. This is warning-only;
 there is no automatic October 1 cutoff or change to outgoing scope settings.

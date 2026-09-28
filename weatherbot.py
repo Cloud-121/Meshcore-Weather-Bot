@@ -45,9 +45,8 @@ PING_COMMAND = re.compile(r"\s*ping(?:\s+(json))?\s*", re.IGNORECASE)
 RAW_PATH_CACHE_SECONDS = 10.0
 RAW_PATH_CACHE_LIMIT = 128
 REGION_NOTICE = (
-    'Your messege didn\'t have the "us-msy" region code attached, October 1st; '
-    'The Gulf Coast Mesh will be switching this bot to only respond to "us-msy". '
-    'For more information please check our Discord or Facebook.'
+    'Missing "us-msy" region. From Oct 1, Gulf Coast Mesh bot will require "us-msy". '
+    'See our Discord or Facebook for info.'
 )
 HELP_TEXT = (
     "Gulf Coast Mesh Bot, Designed by ScarlettOSA\n"
