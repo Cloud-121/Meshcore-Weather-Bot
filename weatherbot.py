@@ -45,7 +45,7 @@ PING_COMMAND = re.compile(r"\s*ping(?:\s+(json))?\s*", re.IGNORECASE)
 RAW_PATH_CACHE_SECONDS = 10.0
 RAW_PATH_CACHE_LIMIT = 128
 REGION_NOTICE = (
-    'Missing "us-msy" region. From Oct 1, Gulf Coast Mesh bot will require "us-msy". '
+    'Missing "us-la-msy" region. From Oct 1, Gulf Coast Mesh bot will require "us-la-msy". '
     'See our Discord or Facebook for info.'
 )
 HELP_TEXT = (
@@ -655,7 +655,7 @@ class WeatherBot:
         status = match.required_region_match if len(statuses) == 1 else None
         region = message.region
         if status is not None:
-            region = "us-msy" if status else None
+            region = "us-la-msy" if status else None
         if len(statuses) > 1:
             region = None
         return replace(
@@ -1450,7 +1450,7 @@ def raw_region_match(payload: Any) -> Optional[bool]:
             return None
         if not scoped:
             return False
-        key = hashlib.sha256(b"#us-msy").digest()[:16]
+        key = hashlib.sha256(b"#us-la-msy").digest()[:16]
         digest = hmac.digest(key, bytes([payload_type]) + encrypted, "sha256")
         code = int.from_bytes(digest[:2], "little")
         code = 1 if code == 0 else 65534 if code == 65535 else code
@@ -1462,7 +1462,7 @@ def raw_region_match(payload: Any) -> Optional[bool]:
 def has_required_region(message: InboundMessage) -> bool:
     if message.required_region_match is not None:
         return message.required_region_match
-    return (message.region or "").strip().removeprefix("#") == "us-msy"
+    return (message.region or "").strip().removeprefix("#") == "us-la-msy"
 
 
 def region_or_none(payload: Any) -> Optional[str]:

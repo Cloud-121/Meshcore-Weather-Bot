@@ -46,21 +46,21 @@ falls back to hop count. DM pings use the reliable hop-count fallback because th
 encrypted raw packets cannot be matched safely. When both the bot and a DM sender have
 advertised GPS coordinates, `ping` also shows their approximate straight-line distance;
 this is not the distance through relay nodes. `ping json` is also available for
-structured diagnostic output. A human pong shows `us-msy` when verified from a matching
+structured diagnostic output. A human pong shows `us-la-msy` when verified from a matching
 raw packet, or a resolved region supplied by the companion when packet verification
 is unavailable.
 
 Human command replies in `#Weather` and `#test` include the following notice unless
-`us-msy` is verified. The requested answer is still sent normally:
+`us-la-msy` is verified. The requested answer is still sent normally:
 
-> Missing "us-msy" region. From Oct 1, Gulf Coast Mesh bot will require "us-msy". See our Discord or Facebook for info.
+> Missing "us-la-msy" region. From Oct 1, Gulf Coast Mesh bot will require "us-la-msy". See our Discord or Facebook for info.
 
 DMs, all JSON/API commands, and scheduled alerts are exempt. This is warning-only;
 there is no automatic October 1 cutoff or change to outgoing scope settings.
 
 MeshCore's app saves the sending region scope per channel, while each RF packet
 carries message-dependent transport codes. The bot checks the first transport code
-against `us-msy` using the [firmware algorithm](https://github.com/meshcore-dev/MeshCore/blob/main/src/helpers/TransportKeyStore.cpp),
+against `us-la-msy` using the [firmware algorithm](https://github.com/meshcore-dev/MeshCore/blob/main/src/helpers/TransportKeyStore.cpp),
 correlating raw logs by channel, timestamp, and full sender-prefixed text. See also
 [MeshCore region scoping](https://blog.meshcore.io/2026/01/20/region-filtering).
 Missing logs (including messages queued while disconnected), malformed packets, and

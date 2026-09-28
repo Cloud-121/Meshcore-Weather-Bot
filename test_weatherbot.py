@@ -467,7 +467,7 @@ class RoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
             sent = list(commands.channel_messages)
             self.assertTrue(await bot.handle_message(mesh, message))
             self.assertEqual(commands.channel_messages, sent)
-            self.assertIn('Missing "us-msy" region.', " ".join(text for _, text in sent))
+            self.assertIn('Missing "us-la-msy" region.', " ".join(text for _, text in sent))
 
 
 class FakeSetupCommands:
@@ -557,15 +557,15 @@ class FakeQueuedMessageMesh:
 
 
 class RegionTests(unittest.IsolatedAsyncioTestCase):
-    FRAME = "14842e842e0001020300000000000000000000000000000000"
+    FRAME = "14cfd0cfd00001020300000000000000000000000000000000"
 
     def test_firmware_transport_vectors_and_reserved_codes(self):
-        # SHA256('#us-msy')[:16], HMAC(type || encrypted payload)[:2].
+        # SHA256('#us-la-msy')[:16], HMAC(type || encrypted payload)[:2].
         # The latter two vectors produce 0000/ffff before firmware adjustment.
         for frame in (
             self.FRAME,
-            "1401000100000102030c2c0000000000000000000000000000",
-            "14fefffeff0001020322710000000000000000000000000000",
+            "140100010000010203f7250100000000000000000000000000",
+            "14fefffeff00010203181d0000000000000000000000000000",
         ):
             with self.subTest(frame=frame):
                 self.assertTrue(weatherbot.raw_region_match({"payload": frame}))
@@ -592,7 +592,7 @@ class RegionTests(unittest.IsolatedAsyncioTestCase):
                 bot._remember_raw_channel_event(event)
                 matched = bot._attach_raw_channel_path(message)
                 self.assertTrue(matched.required_region_match)
-                self.assertEqual(matched.region, "us-msy")
+                self.assertEqual(matched.region, "us-la-msy")
                 self.assertEqual(matched.path, "")
                 for changes in (dict(text="Bob: wx 60601"), dict(channel_index=2),
                                 dict(channel_index=None), dict(sender_timestamp=101)):
@@ -602,7 +602,7 @@ class RegionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(bot._raw_channel_paths)
             bot._remember_raw_channel_event(event)
             bot._remember_raw_channel_event({**event, "payload": "140000" + self.FRAME[6:]})
-            conflicting = bot._attach_raw_channel_path(weatherbot.replace(message, region="us-msy"))
+            conflicting = bot._attach_raw_channel_path(weatherbot.replace(message, region="us-la-msy"))
             self.assertIsNone(conflicting.required_region_match)
             self.assertFalse(weatherbot.has_required_region(conflicting))
             for timestamp in range(weatherbot.RAW_PATH_CACHE_LIMIT + 10):
@@ -651,7 +651,7 @@ class RegionTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await bot.handle_message(FakeMesh(commands), weatherbot.InboundMessage("wx 60601", channel_index=1)))
             body = " ".join(text for _, text in commands.channel_messages)
             self.assertIn("lookup failed: unavailable", body)
-            self.assertIn('Missing "us-msy" region.', body)
+            self.assertIn('Missing "us-la-msy" region.', body)
 
     async def test_json_api_and_dm_exemptions(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -664,18 +664,18 @@ class RegionTests(unittest.IsolatedAsyncioTestCase):
                                      ("ping api2", 3)):
                 commands = FakeSetupCommands()
                 self.assertTrue(await bot.handle_message(FakeMesh(commands), weatherbot.InboundMessage(command, channel_index=channel)))
-                self.assertNotIn('Missing "us-msy" region.', " ".join(text for _, text in commands.channel_messages))
+                self.assertNotIn('Missing "us-la-msy" region.', " ".join(text for _, text in commands.channel_messages))
             bot._has_contact = AsyncMock(return_value=True)
             bot.send_dm_with_fallback = AsyncMock()
             await bot.handle_message(object(), weatherbot.InboundMessage("wx help", sender_prefix="aabbccddeeff"))
-            self.assertNotIn('Missing "us-msy" region.', " ".join(call.args[2] for call in bot.send_dm_with_fallback.call_args_list))
+            self.assertNotIn('Missing "us-la-msy" region.', " ".join(call.args[2] for call in bot.send_dm_with_fallback.call_args_list))
 
     def test_explicit_region_fallback_and_packet_precedence(self):
-        for name in ("us-msy", "#us-msy", " us-msy "):
+        for name in ("us-la-msy", "#us-la-msy", " us-la-msy "):
             self.assertTrue(weatherbot.has_required_region(weatherbot.InboundMessage("ping", region=name)))
-        for name in (None, "us-gulf", "US-MSY"):
+        for name in (None, "us-msy", "us-gulf", "US-LA-MSY"):
             self.assertFalse(weatherbot.has_required_region(weatherbot.InboundMessage("ping", region=name)))
-        self.assertFalse(weatherbot.has_required_region(weatherbot.InboundMessage("ping", region="us-msy", required_region_match=False)))
+        self.assertFalse(weatherbot.has_required_region(weatherbot.InboundMessage("ping", region="us-la-msy", required_region_match=False)))
 
 
 class MeshAdapterTests(unittest.IsolatedAsyncioTestCase):
