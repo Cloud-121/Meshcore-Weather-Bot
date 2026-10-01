@@ -50,21 +50,36 @@ structured diagnostic output. A human pong shows `us-la-msy` when verified from 
 raw packet, or a resolved region supplied by the companion when packet verification
 is unavailable.
 
-Human command replies in `#Weather` and `#test` include the following notice unless
-`us-la-msy` is verified. The requested answer is still sent normally:
+All incoming commands in `#Weather` and `#test`, including ordinary JSON commands,
+require `us-la-msy`. Messages without a matching region are silently ignored;
+the bot sends no region warning or command response.
 
-> Missing "us-la-msy" region. From Oct 1, Gulf Coast Mesh bot will require "us-la-msy". See our Discord or Facebook for info.
+DMs, API and API v2 commands on `#wx-bot-hidden`, and scheduled alerts are exempt.
+Incoming enforcement is immediate.
 
-DMs, all JSON/API commands, and scheduled alerts are exempt. This is warning-only;
-there is no automatic October 1 cutoff or change to outgoing scope settings.
+Outgoing non-API messages use the `#us-la-msy` flood scope: Weather/test replies,
+ordinary JSON replies, scheduled channel alerts, and personal alerts. DMs keep their
+acknowledged direct routes and retries; any flood delivery or fallback carries the
+region transport code. Direct packets use their existing routes without region
+transport codes. API and API v2 replies, including DMs, explicitly force unscoped
+flood delivery when flooding is needed.
+
+The bot selects the temporary scope before each send under its companion lock and
+clears the override afterward, including on errors. It does not change the saved
+default scope. Startup checks support for both regional and forced-unscoped sending
+and fails if either is unavailable. Advertisements and firmware-generated control
+packets are outside this application-message policy.
 
 MeshCore's app saves the sending region scope per channel, while each RF packet
 carries message-dependent transport codes. The bot checks the first transport code
 against `us-la-msy` using the [firmware algorithm](https://github.com/meshcore-dev/MeshCore/blob/main/src/helpers/TransportKeyStore.cpp),
 correlating raw logs by channel, timestamp, and full sender-prefixed text. See also
 [MeshCore region scoping](https://blog.meshcore.io/2026/01/20/region-filtering).
-Missing logs (including messages queued while disconnected), malformed packets, and
-unresolved scopes also receive the notice. Region matching is a routing check, not
+When packet verification is unavailable, the bot accepts a resolved `us-la-msy`
+region supplied by the companion. A verified packet mismatch takes precedence over
+the resolved name. Missing logs (including messages queued while disconnected),
+malformed packets, and unresolved scopes are rejected unless a resolved matching
+region is available. Region matching is a routing check, not
 sender authentication.
 
 Before a DM reply the bot

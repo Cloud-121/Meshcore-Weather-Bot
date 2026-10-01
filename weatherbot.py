@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 from collections import deque
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -44,10 +45,6 @@ WX_REPORT_COMMAND = re.compile(
 PING_COMMAND = re.compile(r"\s*ping(?:\s+(json))?\s*", re.IGNORECASE)
 RAW_PATH_CACHE_SECONDS = 10.0
 RAW_PATH_CACHE_LIMIT = 128
-REGION_NOTICE = (
-    'Missing "us-la-msy" region. From Oct 1, Gulf Coast Mesh bot will require "us-la-msy". '
-    'See our Discord or Facebook for info.'
-)
 HELP_TEXT = (
     "Gulf Coast Mesh Bot, Designed by ScarlettOSA\n"
     "wx ZIPCODE: weather report\n"
@@ -512,6 +509,10 @@ class WeatherBot:
                     f"companion reported mode {path_hash_mode!r}, expected 1"
                 )
             LOG.info("Companion path hash mode set to 1 (two bytes per hop)")
+            # Probe both modes before any application messages can be sent.
+            for api in (False, True):
+                async with self._flood_scope_unlocked(mesh, api=api):
+                    pass
             if self.config.weather_channel_key:
                 secret = decode_channel_key(self.config.weather_channel_key)
                 self._require_event(
@@ -767,6 +768,14 @@ class WeatherBot:
             self.config.test_channel_index,
         ):
             return False
+        if (
+            message.is_channel
+            and message.channel_index in (
+                self.config.weather_channel_index, self.config.test_channel_index
+            )
+            and not has_required_region(message)
+        ):
+            return False
         command = command_text(message.text, message.is_channel)
         # Explicit opt-in only; the original message remains the deduplication key.
         if re.search(r"\s+api2\s*$", command, re.IGNORECASE):
@@ -999,14 +1008,6 @@ class WeatherBot:
                     if isinstance(response, dict)
                     else f"{response}\n\n{UNKNOWN_SENDER_NOTICE}"
                 )
-        if (
-            isinstance(response, str)
-            and message.channel_index in (
-                self.config.weather_channel_index, self.config.test_channel_index
-            )
-            and not has_required_region(message)
-        ):
-            response += "\n\n" + REGION_NOTICE
         chunks = (
             split_mesh_json(response)
             if isinstance(response, dict)
@@ -1048,9 +1049,9 @@ class WeatherBot:
                                    flood_warning=flood_warning)
         for chunk in chunks:
             if message.is_channel:
-                await self.send_channel(mesh, chunk, message.channel_index)
+                await self.send_channel(mesh, chunk, message.channel_index, api=True)
             else:
-                await self.send_dm_with_fallback(mesh, message.sender_prefix, chunk)
+                await self.send_dm_with_fallback(mesh, message.sender_prefix, chunk, api=True)
 
     async def _reply_api(
         self, mesh: Any, message: InboundMessage, parts: list[dict[str, Any]]
@@ -1064,18 +1065,45 @@ class WeatherBot:
         chunks = api_mesh_envelopes(parts, flood_warning=flood_warning)
         if message.is_channel:
             for chunk in chunks:
-                await self.send_channel(mesh, chunk, message.channel_index)
+                await self.send_channel(mesh, chunk, message.channel_index, api=True)
             return
         if not message.sender_prefix:
             raise MeshError("a queued DM did not include its sender key prefix")
         for chunk in chunks:
-            await self.send_dm_with_fallback(mesh, message.sender_prefix, chunk)
+            await self.send_dm_with_fallback(mesh, message.sender_prefix, chunk, api=True)
+
+    @asynccontextmanager
+    async def _flood_scope_unlocked(self, mesh: Any, *, api: bool = False):
+        """Select temporary scope while the caller holds the mesh lock."""
+        scope = "*" if api else "#us-la-msy"
+        failed = False
+        try:
+            self._require_event(
+                await mesh.commands.set_flood_scope(scope),
+                EventType.OK,
+                f"selecting outgoing flood scope {scope}",
+            )
+            yield
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            try:
+                self._require_event(
+                    await mesh.commands.set_flood_scope(None),
+                    EventType.OK,
+                    "clearing outgoing flood scope override",
+                )
+            except Exception as exc:
+                LOG.error("Could not clear outgoing flood scope override: %s", exc)
+                if not failed:
+                    raise
 
     async def send_channel(
-        self, mesh: Any, text: str, channel_index: Optional[int] = None
+        self, mesh: Any, text: str, channel_index: Optional[int] = None, *, api: bool = False
     ) -> None:
         channel_index = self.config.weather_channel_index if channel_index is None else channel_index
-        async with self._mesh_lock:
+        async with self._mesh_lock, self._flood_scope_unlocked(mesh, api=api):
             self._require_event(
                 await mesh.commands.send_chan_msg(channel_index, text),
                 EventType.OK,
@@ -1083,7 +1111,7 @@ class WeatherBot:
             )
 
     async def send_dm_with_fallback(
-        self, mesh: Any, sender_prefix: str | bytes, text: str
+        self, mesh: Any, sender_prefix: str | bytes, text: str, *, api: bool = False
     ) -> bool:
         """Refresh the route from the newest advert path, then retry, then flood."""
         prefix = (
@@ -1091,7 +1119,7 @@ class WeatherBot:
         ).lower()
         timestamp = int(time.time())
 
-        async with self._mesh_lock:
+        async with self._mesh_lock, self._flood_scope_unlocked(mesh, api=api):
             contact = await self._find_contact_unlocked(mesh, prefix)
             if contact is None:
                 result = self._require_event(

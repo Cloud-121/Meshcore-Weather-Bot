@@ -185,7 +185,8 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_dm_warning_subscription_and_ping(self):
         sent = []
 
-        async def send(mesh, prefix, text):
+        async def send(mesh, prefix, text, *, api=False):
+            self.assertTrue(api)
             sent.append(text)
 
         with patch.object(self.bot, "_has_contact", AsyncMock(return_value=False)), \
@@ -216,7 +217,10 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             for command in ["wx 00601 api2", "wx 00601 json"]:
                 self.commands.channel_messages.clear()
                 channel = 3 if command.endswith("api2") else 1
-                await self.bot.handle_message(self.mesh, weatherbot.InboundMessage(command, channel_index=channel))
+                await self.bot.handle_message(self.mesh, weatherbot.InboundMessage(
+                    command, channel_index=channel,
+                    required_region_match=True if channel == 1 else None,
+                ))
                 texts = [text for _, text in self.commands.channel_messages]
                 if command.endswith("api2"):
                     result = api_v2.decode(texts)["data"]

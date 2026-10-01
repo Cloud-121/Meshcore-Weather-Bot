@@ -273,8 +273,21 @@ class ConfigurationTests(unittest.TestCase):
                 weatherbot.load_config(path)
 
 
-class FakeRoutingCommands:
+class FakeScopeCommands:
+    def __init__(self):
+        self.scope = None
+        self.scope_calls = []
+        self.sent_scopes = []
+
+    async def set_flood_scope(self, scope):
+        self.scope_calls.append(scope)
+        self.scope = scope
+        return FakeEvent(EventType.OK)
+
+
+class FakeRoutingCommands(FakeScopeCommands):
     def __init__(self, ack=b"\x12\x34\x56\x78", advert_path=None):
+        super().__init__()
         self.ack = ack
         self.attempts = []
         self.reset_contacts = []
@@ -284,6 +297,7 @@ class FakeRoutingCommands:
         self.flood = False
 
     async def send_msg(self, contact, text, timestamp, attempt):
+        self.sent_scopes.append(self.scope)
         self.attempts.append((contact, text, timestamp, attempt))
         return FakeEvent(
             EventType.MSG_SENT,
@@ -344,6 +358,8 @@ class RoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item[3] for item in mesh.commands.attempts], [0, 1, 2, 3, 4])
         self.assertEqual(len({item[2] for item in mesh.commands.attempts}), 1)
         self.assertEqual(mesh.commands.reset_contacts, [contact])
+        self.assertEqual(mesh.commands.sent_scopes, ["#us-la-msy"] * 5)
+        self.assertEqual(mesh.commands.scope_calls, ["#us-la-msy", None])
 
     async def test_ack_received_before_wait_prevents_retry(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -461,17 +477,19 @@ class RoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
             commands = FakeSetupCommands()
             mesh = FakeMesh(commands)
             message = weatherbot.InboundMessage(
-                "Alice: wx 60601", channel_index=1, sender_timestamp=100
+                "Alice: wx 60601", channel_index=1, sender_timestamp=100,
+                required_region_match=True,
             )
             self.assertTrue(await bot.handle_message(mesh, message))
             sent = list(commands.channel_messages)
             self.assertTrue(await bot.handle_message(mesh, message))
             self.assertEqual(commands.channel_messages, sent)
-            self.assertIn('Missing "us-la-msy" region.', " ".join(text for _, text in sent))
+            self.assertNotIn('Missing "us-la-msy" region.', " ".join(text for _, text in sent))
 
 
-class FakeSetupCommands:
+class FakeSetupCommands(FakeScopeCommands):
     def __init__(self, path_hash_set_event=None, path_hash_mode=1):
+        super().__init__()
         self.calls = []
         self.channel_messages = []
         self.path_hash_set_event = path_hash_set_event or FakeEvent(EventType.OK)
@@ -523,8 +541,174 @@ class FakeSetupCommands:
         return FakeEvent(EventType.OK)
 
     async def send_chan_msg(self, index, text):
+        self.sent_scopes.append(self.scope)
         self.channel_messages.append((index, text))
         return FakeEvent(EventType.OK)
+
+
+class OutgoingScopeTests(unittest.IsolatedAsyncioTestCase):
+    def make_bot(self, directory):
+        return weatherbot.WeatherBot(
+            make_config(Path(directory) / "state.json"), weather=FakeBriefWeather()
+        )
+
+    async def test_alternating_api_and_regional_channel_sends(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot = self.make_bot(directory)
+            commands = FakeSetupCommands()
+            mesh = FakeMesh(commands)
+            await bot.send_channel(mesh, "weather")
+            await bot.send_channel(mesh, "api", 3, api=True)
+            await bot.send_channel(mesh, "pong", 2)
+            self.assertEqual(commands.sent_scopes, ["#us-la-msy", "*", "#us-la-msy"])
+            self.assertEqual(commands.scope_calls, ["#us-la-msy", None, "*", None, "#us-la-msy", None])
+            self.assertIsNone(commands.scope)
+
+    async def test_unknown_and_missing_route_dm_scopes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for known in (False, True):
+                for api in (False, True):
+                    with self.subTest(known=known, api=api):
+                        bot = self.make_bot(directory)
+                        commands = FakeRoutingCommands()
+                        commands.flood = True
+                        if known:
+                            bot._contacts["aabbccddeeff"] = {
+                                "public_key": "aabbccddeeff" + "00" * 26,
+                                "out_path_len": -1,
+                            }
+                        self.assertTrue(await bot.send_dm_with_fallback(
+                            FakeMesh(commands), "aabbccddeeff", "reply", api=api,
+                        ))
+                        scope = "*" if api else "#us-la-msy"
+                        self.assertEqual(commands.sent_scopes, [scope])
+                        self.assertEqual(commands.scope_calls, [scope, None])
+
+    async def test_api_dm_reply_paths_select_unscoped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot = self.make_bot(directory)
+            commands = FakeRoutingCommands()
+            mesh = FakeMesh(commands)
+            for command in ("bot json api", "bot api2", "wx 60601 all api2"):
+                with self.subTest(command=command):
+                    commands.sent_scopes.clear()
+                    self.assertTrue(await bot.handle_message(
+                        mesh, weatherbot.InboundMessage(command, sender_prefix="aabbccddeeff"),
+                    ))
+                    self.assertTrue(commands.sent_scopes)
+                    self.assertEqual(set(commands.sent_scopes), {"*"})
+                    self.assertIsNone(commands.scope)
+
+    async def test_scope_selection_failure_prevents_send(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot = self.make_bot(directory)
+            commands = FakeSetupCommands()
+            commands.set_flood_scope = AsyncMock(side_effect=[
+                FakeEvent(EventType.ERROR, {"reason": "unsupported"}),
+                FakeEvent(EventType.OK),
+            ])
+            with self.assertRaisesRegex(weatherbot.MeshError, "selecting outgoing flood scope.*unsupported"):
+                await bot.send_channel(FakeMesh(commands), "weather")
+            self.assertFalse(commands.channel_messages)
+            self.assertEqual([call.args[0] for call in commands.set_flood_scope.call_args_list], ["#us-la-msy", None])
+            self.assertFalse(bot._mesh_lock.locked())
+
+    async def test_cleanup_after_send_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot = self.make_bot(directory)
+            commands = FakeSetupCommands()
+            commands.send_chan_msg = AsyncMock(side_effect=RuntimeError("send failed"))
+            with self.assertRaisesRegex(RuntimeError, "send failed"):
+                await bot.send_channel(FakeMesh(commands), "weather")
+            self.assertEqual(commands.scope_calls, ["#us-la-msy", None])
+            self.assertIsNone(commands.scope)
+            self.assertFalse(bot._mesh_lock.locked())
+
+    async def test_cleanup_failure_preserves_original_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for send_fails in (False, True):
+                with self.subTest(send_fails=send_fails):
+                    bot = self.make_bot(directory)
+                    commands = FakeSetupCommands()
+                    commands.set_flood_scope = AsyncMock(side_effect=[
+                        FakeEvent(EventType.OK),
+                        FakeEvent(EventType.ERROR, {"reason": "cleanup failed"}),
+                    ])
+                    if send_fails:
+                        commands.send_chan_msg = AsyncMock(side_effect=RuntimeError("send failed"))
+                    expected = RuntimeError if send_fails else weatherbot.MeshError
+                    reason = "send failed" if send_fails else "cleanup failed"
+                    with self.assertLogs("weatherbot", level="ERROR") as logs:
+                        with self.assertRaisesRegex(expected, reason):
+                            await bot.send_channel(FakeMesh(commands), "weather")
+                    self.assertIn("Could not clear outgoing flood scope override", " ".join(logs.output))
+                    self.assertFalse(bot._mesh_lock.locked())
+
+    async def test_concurrent_sends_do_not_change_active_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot = self.make_bot(directory)
+            commands = FakeSetupCommands()
+            mesh = FakeMesh(commands)
+            started = asyncio.Event()
+            release = asyncio.Event()
+            send = commands.send_chan_msg
+
+            async def blocked_send(index, text):
+                if text == "weather":
+                    started.set()
+                    await release.wait()
+                return await send(index, text)
+
+            commands.send_chan_msg = blocked_send
+            regional = asyncio.create_task(bot.send_channel(mesh, "weather"))
+            await asyncio.wait_for(started.wait(), 1)
+            api = asyncio.create_task(bot.send_channel(mesh, "api", 3, api=True))
+            try:
+                await asyncio.sleep(0)
+                self.assertEqual(commands.scope_calls, ["#us-la-msy"])
+                release.set()
+                await asyncio.wait_for(asyncio.gather(regional, api), 1)
+            finally:
+                release.set()
+                await asyncio.gather(regional, api, return_exceptions=True)
+            self.assertEqual(commands.sent_scopes, ["#us-la-msy", "*"])
+            self.assertEqual(commands.scope_calls, ["#us-la-msy", None, "*", None])
+
+    async def test_cancelled_send_clears_scope_before_unlocking(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot = self.make_bot(directory)
+            commands = FakeSetupCommands()
+            started = asyncio.Event()
+
+            async def blocked_send(index, text):
+                started.set()
+                await asyncio.Event().wait()
+
+            commands.send_chan_msg = blocked_send
+            task = asyncio.create_task(bot.send_channel(FakeMesh(commands), "weather"))
+            try:
+                await asyncio.wait_for(started.wait(), 1)
+            finally:
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+            self.assertEqual(commands.scope_calls, ["#us-la-msy", None])
+            self.assertIsNone(commands.scope)
+            self.assertFalse(bot._mesh_lock.locked())
+
+    async def test_setup_rejects_unsupported_scope_modes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for api in (False, True):
+                with self.subTest(api=api):
+                    bot = self.make_bot(directory)
+                    commands = FakeSetupCommands()
+                    events = [FakeEvent(EventType.OK)] * (2 if api else 0)
+                    events += [FakeEvent(EventType.ERROR, {"reason": "unsupported"}), FakeEvent(EventType.OK)]
+                    commands.set_flood_scope = AsyncMock(side_effect=events)
+                    with self.assertRaisesRegex(weatherbot.MeshError, "selecting outgoing flood scope.*unsupported"):
+                        await bot._prepare_mesh(FakeMesh(commands))
+                    self.assertNotIn(("send_advert", True), commands.calls)
+                    self.assertFalse(bot._mesh_lock.locked())
 
 
 class FakeBriefWeather:
@@ -620,55 +804,100 @@ class RegionTests(unittest.IsolatedAsyncioTestCase):
                 await bot._serve_connection(StopOnSubscribe())
             self.assertFalse(bot._raw_channel_paths)
 
-    async def test_human_commands_warn_but_keep_answers(self):
+    async def test_channel_commands_require_region(self):
         with tempfile.TemporaryDirectory() as directory:
             bot = weatherbot.WeatherBot(make_config(Path(directory) / "state.json"), weather=FakeBriefWeather())
+            bot.weather.weather_report = AsyncMock(return_value="WX 60601: Clear, 72F.")
+            bot.weather.weather_json = AsyncMock(return_value={"type": "current", "t": 72})
             for command, channel, answer in (
                 ("wx 60601", 1, "WX 60601: Clear, 72F."),
                 ("wx help", 1, "Gulf Coast Mesh Bot"),
                 ("wx version", 1, "Gulf Coast Mesh Bot version:"),
                 ("wx report 60601", 1, "Please run wx report"),
+                ("wx report stop", 1, "Please run wx report"),
                 ("ping", 2, "Pong"),
+                ("wx 60601 json", 1, '"current"'),
+                ("wx help json", 1, '"help"'),
+                ("wx version json", 1, '"version"'),
+                ("wx report 60601 json", 1, '"error"'),
+                ("wx report stop json", 1, '"error"'),
+                ("ping json", 2, '"pong"'),
             ):
                 for status in (None, False, True):
                     with self.subTest(command=command, status=status):
                         commands = FakeSetupCommands()
-                        message = weatherbot.InboundMessage("Alice: " + command, channel_index=channel, required_region_match=status)
-                        self.assertTrue(await bot.handle_message(FakeMesh(commands), message))
+                        bot.weather.weather_report.reset_mock()
+                        bot.weather.weather_json.reset_mock()
+                        bot._seen_requests.clear()
+                        message = weatherbot.InboundMessage(
+                            "Alice: " + command, channel_index=channel,
+                            sender_timestamp=100, required_region_match=status,
+                        )
+                        handled = await bot.handle_message(FakeMesh(commands), message)
+                        self.assertEqual(handled, status is True)
+                        if status is not True:
+                            self.assertFalse(commands.channel_messages)
+                            self.assertFalse(commands.calls)
+                            bot.weather.weather_report.assert_not_awaited()
+                            bot.weather.weather_json.assert_not_awaited()
+                            self.assertFalse(bot._seen_requests)
+                            continue
                         chunks = [text for _, text in commands.channel_messages]
                         body = " ".join(weatherbot.re.sub(r"^\[\d+/\d+\] ", "", text) for text in chunks)
                         self.assertIn(answer, body)
-                        self.assertEqual(body.count(weatherbot.REGION_NOTICE), 0 if status is True else 1)
-                        self.assertEqual(
-                            sum(weatherbot.REGION_NOTICE in chunk for chunk in chunks),
-                            0 if status is True else 1,
-                        )
+                        self.assertNotIn('Missing "us-la-msy" region.', body)
+                        self.assertEqual(commands.sent_scopes, ["#us-la-msy"] * len(chunks))
                         self.assertTrue(all(len(text.encode()) <= 140 for text in chunks))
             commands = FakeSetupCommands()
             self.assertFalse(await bot.handle_message(FakeMesh(commands), weatherbot.InboundMessage("Alice: hello", channel_index=1)))
             self.assertFalse(commands.channel_messages)
             bot.weather.weather_report = AsyncMock(side_effect=weatherbot.WeatherError("unavailable"))
-            self.assertTrue(await bot.handle_message(FakeMesh(commands), weatherbot.InboundMessage("wx 60601", channel_index=1)))
+            self.assertTrue(await bot.handle_message(FakeMesh(commands), weatherbot.InboundMessage("wx 60601", channel_index=1, required_region_match=True)))
             body = " ".join(text for _, text in commands.channel_messages)
             self.assertIn("lookup failed: unavailable", body)
-            self.assertIn('Missing "us-la-msy" region.', body)
+            self.assertNotIn('Missing "us-la-msy" region.', body)
 
-    async def test_json_api_and_dm_exemptions(self):
+    async def test_api_and_dm_exemptions(self):
         with tempfile.TemporaryDirectory() as directory:
             bot = weatherbot.WeatherBot(make_config(Path(directory) / "state.json"), weather=FakeBriefWeather())
             bot.weather.weather_json = AsyncMock(return_value={"type": "current", "t": 72})
-            for command, channel in (("wx help json", 1), ("wx version json", 1),
-                                     ("wx 60601 json", 1), ("wx report 60601 json", 1),
-                                     ("ping json", 2), ("bot json api", 3),
-                                     ("wx 60601 json all api", 3), ("bot api2", 3),
-                                     ("ping api2", 3)):
-                commands = FakeSetupCommands()
-                self.assertTrue(await bot.handle_message(FakeMesh(commands), weatherbot.InboundMessage(command, channel_index=channel)))
-                self.assertNotIn('Missing "us-la-msy" region.', " ".join(text for _, text in commands.channel_messages))
+            for command in ("bot json api", "wx 60601 json all api", "bot api2",
+                            "ping api2", "wx 60601 api2", "wx 60601 all api2"):
+                for status in (None, False):
+                    with self.subTest(command=command, status=status):
+                        commands = FakeSetupCommands()
+                        self.assertTrue(await bot.handle_message(FakeMesh(commands), weatherbot.InboundMessage(command, channel_index=3, required_region_match=status)))
+                        self.assertTrue(commands.channel_messages)
+                        self.assertEqual(commands.sent_scopes, ["*"] * len(commands.channel_messages))
+                        self.assertNotIn('Missing "us-la-msy" region.', " ".join(text for _, text in commands.channel_messages))
             bot._has_contact = AsyncMock(return_value=True)
             bot.send_dm_with_fallback = AsyncMock()
-            await bot.handle_message(object(), weatherbot.InboundMessage("wx help", sender_prefix="aabbccddeeff"))
+            for command in ("wx help", "wx help json", "wx 60601", "wx 60601 json",
+                            "wx report 60601", "wx report stop", "ping", "ping json",
+                            "bot json api", "bot api2"):
+                with self.subTest(dm_command=command):
+                    bot.send_dm_with_fallback.reset_mock()
+                    self.assertTrue(await bot.handle_message(FakeMesh(FakeRoutingCommands()), weatherbot.InboundMessage(command, sender_prefix="aabbccddeeff")))
+                    bot.send_dm_with_fallback.assert_awaited()
             self.assertNotIn('Missing "us-la-msy" region.', " ".join(call.args[2] for call in bot.send_dm_with_fallback.call_args_list))
+
+    async def test_region_fallback_controls_acceptance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot = weatherbot.WeatherBot(make_config(Path(directory) / "state.json"), weather=FakeBriefWeather())
+            for region, status, accepted in (
+                ("us-la-msy", None, True), ("#us-la-msy", None, True),
+                (" us-la-msy ", None, True), ("us-gulf", None, False),
+                ("US-LA-MSY", None, False), ("us-la-msy", False, False),
+            ):
+                with self.subTest(region=region, status=status):
+                    commands = FakeSetupCommands()
+                    self.assertEqual(await bot.handle_message(
+                        FakeMesh(commands), weatherbot.InboundMessage(
+                            "Alice: wx help", channel_index=1, region=region,
+                            required_region_match=status,
+                        ),
+                    ), accepted)
+                    self.assertEqual(bool(commands.channel_messages), accepted)
 
     def test_explicit_region_fallback_and_packet_precedence(self):
         for name in ("us-la-msy", "#us-la-msy", " us-la-msy "):
@@ -805,6 +1034,7 @@ class MeshAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("aabbccddeeff", bot._contacts)
         self.assertTrue(mesh.decrypt_channel_logs)
+        self.assertEqual(commands.scope_calls, ["#us-la-msy", None, "*", None])
 
     async def test_setup_fails_when_two_byte_path_hash_mode_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -844,7 +1074,7 @@ class MeshAdapterTests(unittest.IsolatedAsyncioTestCase):
             commands = FakeSetupCommands()
             handled = await bot.handle_message(
                 FakeMesh(commands),
-                weatherbot.InboundMessage("Alice: wx 60601", channel_index=1),
+                weatherbot.InboundMessage("Alice: wx 60601", channel_index=1, required_region_match=True),
             )
         self.assertTrue(handled)
         self.assertEqual(commands.channel_messages[0][0], 1)
@@ -904,6 +1134,7 @@ class AlertPollingTests(unittest.IsolatedAsyncioTestCase):
                 " ".join(text for _index, text in commands.channel_messages),
             )
             first_count = len(commands.channel_messages)
+            self.assertEqual(commands.sent_scopes, ["#us-la-msy"] * first_count)
             self.assertEqual(await bot.poll_alerts(mesh), 0)
             self.assertEqual(len(commands.channel_messages), first_count)
 
@@ -972,6 +1203,7 @@ class CommandFeatureTests(unittest.IsolatedAsyncioTestCase):
                 "To stop these alerts: wx report stop",
                 "".join(item[1] for item in commands.attempts),
             )
+            self.assertEqual(commands.sent_scopes, ["#us-la-msy"] * len(commands.attempts))
             sent = len(commands.attempts)
             self.assertEqual(await bot.poll_alerts(mesh), 0)
             self.assertEqual(len(commands.attempts), sent)
