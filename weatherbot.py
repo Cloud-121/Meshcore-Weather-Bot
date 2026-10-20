@@ -561,17 +561,6 @@ class WeatherBot:
                     EventType.OK,
                     "configuring the API channel",
                 )
-            if self.config.fishing_channel_index is not None and self.config.fishing_channel_key:
-                secret = decode_channel_key(self.config.fishing_channel_key)
-                self._require_event(
-                    await mesh.commands.set_channel(
-                        self.config.fishing_channel_index,
-                        self.config.fishing_channel_name,
-                        secret,
-                    ),
-                    EventType.OK,
-                    "configuring #fishing",
-                )
 
             channel = self._require_event(
                 await mesh.commands.get_channel(self.config.weather_channel_index),
@@ -613,20 +602,7 @@ class WeatherBot:
                 )
 
             if self.config.fishing_channel_index is not None:
-                fishing_channel = self._require_event(
-                    await mesh.commands.get_channel(self.config.fishing_channel_index),
-                    EventType.CHANNEL_INFO,
-                    "reading #fishing",
-                )
-                actual_fishing = str(
-                    fishing_channel.payload.get("channel_name") or ""
-                ).lstrip("#")
-                expected_fishing = self.config.fishing_channel_name.lstrip("#")
-                if actual_fishing.casefold() != expected_fishing.casefold():
-                    raise MeshError(
-                        f"channel {self.config.fishing_channel_index} is "
-                        f"{actual_fishing or 'unconfigured'!r}, not {expected_fishing!r}"
-                    )
+                await self._ensure_fishing_channel_unlocked(mesh)
 
             # MeshCore otherwise keeps RF logs encrypted and exposes only the
             # companion's hop count.  With the verified channel keys loaded,
@@ -642,6 +618,49 @@ class WeatherBot:
                 )
                 self._advertised = True
         LOG.info("Weather bot is ready on #%s; API channel #%s", actual, actual_api)
+
+    async def _ensure_fishing_channel_unlocked(self, mesh: Any) -> None:
+        """Add #fishing to the companion if needed, then verify it.
+
+        Without a configured key the channel is a public hashtag channel, whose
+        key MeshCore derives from SHA256("#fishing").  An empty slot is filled
+        automatically; a slot holding a different channel is never overwritten.
+        """
+        index = self.config.fishing_channel_index
+        expected = self.config.fishing_channel_name.lstrip("#")
+
+        async def read() -> str:
+            channel = self._require_event(
+                await mesh.commands.get_channel(index),
+                EventType.CHANNEL_INFO,
+                "reading #fishing",
+            )
+            return str(channel.payload.get("channel_name") or "").lstrip("#")
+
+        if self.config.fishing_channel_key:
+            name, secret = expected, decode_channel_key(self.config.fishing_channel_key)
+        else:
+            actual = await read()
+            if actual.casefold() == expected.casefold():
+                return
+            if actual:
+                raise MeshError(
+                    f"channel {index} is {actual!r}, not {expected!r}; "
+                    "choose a free fishing_channel_index"
+                )
+            name, secret = f"#{expected}", None
+        self._require_event(
+            await mesh.commands.set_channel(index, name, secret),
+            EventType.OK,
+            "configuring #fishing",
+        )
+        actual = await read()
+        if actual.casefold() != expected.casefold():
+            raise MeshError(
+                f"channel {index} is {actual or 'unconfigured'!r} after setup, "
+                f"not {expected!r}"
+            )
+        LOG.info("Configured channel %d as #%s", index, expected)
 
     def _channel_region(self, channel_index: Optional[int]) -> Optional[str]:
         """Return the region a channel's commands must carry; None means exempt."""

@@ -1470,28 +1470,56 @@ class FishingChannelTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(message.required_region_match)
             self.assertFalse(await bot.handle_message(FakeMesh(FakeSetupCommands()), message))
 
-    async def test_setup_verifies_channel_and_probes_scope(self):
-        with tempfile.TemporaryDirectory() as directory:
-            key = base64.b64encode(b"k" * 16).decode()
-            bot = self.make_bot(directory, fishing_channel_key=key)
+    async def test_setup_adds_fishing_channel(self):
+        class Commands(FakeSetupCommands):
+            """Companion whose slot 4 starts as the given name and keeps what is set."""
 
-            class Commands(FakeSetupCommands):
-                def __init__(self, name):
-                    super().__init__()
+            def __init__(self, name):
+                super().__init__()
+                self.name = name
+
+            async def set_channel(self, index, name, secret):
+                if index == 4:
                     self.name = name
+                return await super().set_channel(index, name, secret)
 
-                async def get_channel(self, index):
-                    event = await super().get_channel(index)
-                    if index == 4:
-                        event.payload["channel_name"] = self.name
-                    return event
+            async def get_channel(self, index):
+                event = await super().get_channel(index)
+                if index == 4:
+                    event.payload["channel_name"] = self.name
+                return event
 
-            commands = Commands("#Fishing")
-            await bot._prepare_mesh(FakeMesh(commands))
-            self.assertIn(("set_channel", 4, "fishing", b"k" * 16), commands.calls)
+        with tempfile.TemporaryDirectory() as directory:
+            # An empty slot becomes the public hashtag channel (key from "#fishing").
+            commands = Commands("")
+            await self.make_bot(directory)._prepare_mesh(FakeMesh(commands))
+            self.assertIn(("set_channel", 4, "#fishing", None), commands.calls)
             self.assertEqual(commands.scope_calls[:6], ["#us-la-msy", None, "*", None, "#us-la", None])
-            with self.assertRaisesRegex(weatherbot.MeshError, "channel 4 is 'test', not 'fishing'"):
-                await self.make_bot(directory)._prepare_mesh(FakeMesh(Commands("test")))
+            self.assertIn(("send_advert", True), commands.calls)
+
+            # An existing #fishing channel is left alone.
+            commands = Commands("#Fishing")
+            await self.make_bot(directory)._prepare_mesh(FakeMesh(commands))
+            self.assertFalse([call for call in commands.calls if call[0] == "set_channel"])
+
+            # Another channel in the slot is never overwritten.
+            commands = Commands("Family")
+            with self.assertRaisesRegex(weatherbot.MeshError, "channel 4 is 'Family'.*free fishing_channel_index"):
+                await self.make_bot(directory)._prepare_mesh(FakeMesh(commands))
+            self.assertFalse([call for call in commands.calls if call[0] == "set_channel"])
+            self.assertNotIn(("send_advert", True), commands.calls)
+
+            # A configured private key is always applied.
+            key = base64.b64encode(b"k" * 16).decode()
+            commands = Commands("Family")
+            await self.make_bot(directory, fishing_channel_key=key)._prepare_mesh(FakeMesh(commands))
+            self.assertIn(("set_channel", 4, "fishing", b"k" * 16), commands.calls)
+
+            # The companion must report the channel after configuring it.
+            commands = Commands("")
+            commands.set_channel = AsyncMock(return_value=FakeEvent(EventType.OK))
+            with self.assertRaisesRegex(weatherbot.MeshError, "unconfigured.*after setup"):
+                await self.make_bot(directory)._prepare_mesh(FakeMesh(commands))
 
     def test_config(self):
         with tempfile.TemporaryDirectory() as directory:
