@@ -49,6 +49,7 @@ FISH_COMMAND = re.compile(
 )
 FISH_HELP_COMMAND = re.compile(r"\s*fish(?:\s+help)?\s*", re.IGNORECASE)
 REGION = "us-la-msy"
+BOT_COMMAND_WORD = re.compile(r"\s*(?:wx|fish|ping|bot)\b", re.IGNORECASE)
 RAW_PATH_CACHE_SECONDS = 10.0
 RAW_PATH_CACHE_LIMIT = 128
 HELP_TEXT = (
@@ -618,6 +619,13 @@ class WeatherBot:
                 )
                 self._advertised = True
         LOG.info("Weather bot is ready on #%s; API channel #%s", actual, actual_api)
+        if self.config.fishing_channel_index is None:
+            LOG.info("#fishing is disabled (set fishing_channel_index to enable it)")
+        else:
+            LOG.info(
+                "#fishing is ready on channel %d (requires region %s)",
+                self.config.fishing_channel_index, self.config.fishing_region,
+            )
 
     async def _ensure_fishing_channel_unlocked(self, mesh: Any) -> None:
         """Add #fishing to the companion if needed, then verify it.
@@ -819,6 +827,8 @@ class WeatherBot:
                     or WX_VERSION_COMMAND.fullmatch(command)
                     or WX_REPORT_COMMAND.fullmatch(command)
                     or WX_COMMAND.fullmatch(command)
+                    or FISH_COMMAND.fullmatch(command)
+                    or FISH_HELP_COMMAND.fullmatch(command)
                 )
                 else "no",
             )
@@ -861,6 +871,17 @@ class WeatherBot:
             return False
         region = self._channel_region(message.channel_index)
         if region is not None and not has_required_region(message, region):
+            if BOT_COMMAND_WORD.match(command_text(message.text, True)):
+                # No reply is sent, so say why for whoever runs the bot.
+                LOG.info(
+                    "Ignoring command on channel %d: region %s, requires %s",
+                    message.channel_index,
+                    "unverified" if message.required_region_match is None
+                    and not message.region else
+                    "mismatch" if message.required_region_match is False
+                    else repr(message.region),
+                    region,
+                )
             return False
         command = command_text(message.text, message.is_channel)
         # Explicit opt-in only; the original message remains the deduplication key.

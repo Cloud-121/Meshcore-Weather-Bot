@@ -1385,6 +1385,27 @@ class FishingChannelTests(unittest.IsolatedAsyncioTestCase):
                     else:
                         self.assertFalse(commands.channel_messages)
 
+    async def test_ignored_commands_are_logged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot = self.make_bot(directory)
+            for region, status, reason in (
+                ("us-la-msy", None, "region 'us-la-msy', requires us-la"),
+                (None, None, "region unverified, requires us-la"),
+                ("us-la", False, "region mismatch, requires us-la"),
+            ):
+                with self.subTest(region=region, status=status):
+                    with self.assertLogs("weatherbot", level="INFO") as logs:
+                        await bot.handle_message(FakeMesh(FakeSetupCommands()), weatherbot.InboundMessage(
+                            "Alice: fish 70357", channel_index=4, region=region,
+                            required_region_match=status,
+                        ))
+                    self.assertIn(f"Ignoring command on channel 4: {reason}", " ".join(logs.output))
+            # Ordinary chat stays out of the log.
+            with self.assertNoLogs("weatherbot", level="INFO"):
+                await bot.handle_message(FakeMesh(FakeSetupCommands()), weatherbot.InboundMessage(
+                    "Alice: catching reds today", channel_index=4,
+                ))
+
     async def test_subcommands_help_and_dedup(self):
         with tempfile.TemporaryDirectory() as directory:
             bot = self.make_bot(directory)
