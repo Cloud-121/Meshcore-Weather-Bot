@@ -159,9 +159,14 @@ Also configure `test_channel_index` as `test` (or set both matching values in
 `ping`; its encryption key must already be configured on the companion.
 
 To enable `#fishing`, set `fishing_channel_index` (for example `4`, distinct from the
-other channels) and configure that channel as `fishing` on the companion, or put its
-Base64 key in `fishing_channel_key`. Leave `fishing_channel_index` unset or `null` to
-disable it. The bot verifies the channel name and probes the `#us-la` scope at startup.
+other channels). At startup the bot adds the channel to the companion automatically: if
+that slot is empty it creates the public hashtag channel `#fishing`, whose key MeshCore
+derives from the name, so any client that joins `#fishing` can talk to it. If the slot
+already holds `fishing` it is left unchanged; if it holds a different channel, startup
+fails rather than overwrite it, so pick a free index. To use a private key instead, put
+its Base64 value in `fishing_channel_key` and the bot always applies it. Leave
+`fishing_channel_index` unset or `null` to disable the channel. The bot also probes the
+`#us-la` scope at startup.
 
 ## 2. Configure and run
 
