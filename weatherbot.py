@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from collections import deque
 from contextlib import asynccontextmanager
@@ -2387,6 +2388,23 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         metavar="ZIP",
         help="print one live fishing report without connecting to the repeater",
     )
+    parser.add_argument(
+        "--simulate",
+        metavar="TEXT",
+        help="run TEXT through the bot's command handling and print the replies "
+        "instead of sending them (never connects to the repeater)",
+    )
+    parser.add_argument(
+        "--channel",
+        default="fishing",
+        help="with --simulate: configured channel name the message arrives on, "
+        "or 'dm' (default: fishing)",
+    )
+    parser.add_argument(
+        "--region",
+        help="with --simulate: region the message carries; default is the region "
+        "the channel requires, and 'none' sends it unscoped",
+    )
     return parser.parse_args(argv)
 
 
@@ -2423,6 +2441,113 @@ async def print_fishing(config: BotConfig, zip_code: str) -> int:
         await fishing.close()
 
 
+class SimulatedCommands:
+    """Companion stand-in that prints outgoing messages instead of transmitting."""
+
+    def __init__(self, bot: "WeatherBot") -> None:
+        self.bot = bot
+        self.scope: Optional[str] = None
+        self.sent = 0
+
+    async def set_flood_scope(self, scope: Optional[str]) -> Any:
+        self.scope = scope
+        return _SimulatedEvent(EventType.OK)
+
+    async def send_chan_msg(self, index: int, text: str) -> Any:
+        names = {
+            self.bot.config.weather_channel_index: self.bot.config.weather_channel_name,
+            self.bot.config.api_channel_index: self.bot.config.api_channel_name,
+            self.bot.config.test_channel_index: self.bot.config.test_channel_name,
+            self.bot.config.fishing_channel_index: self.bot.config.fishing_channel_name,
+        }
+        self.sent += 1
+        print(f"--- reply on #{names.get(index, index)} (channel {index}), "
+              f"flood scope {self.scope} ---\n{text}", flush=True)
+        return _SimulatedEvent(EventType.OK)
+
+
+@dataclass
+class _SimulatedEvent:
+    type: Any
+    payload: Any = None
+
+
+async def simulate_message(
+    config: BotConfig, text: str, channel: str, region: Optional[str]
+) -> int:
+    """Handle one message as if it arrived from the mesh, printing the replies."""
+    configured = [
+        (config.weather_channel_name, config.weather_channel_index),
+        (config.api_channel_name, config.api_channel_index),
+        (config.test_channel_name, config.test_channel_index),
+    ]
+    if config.fishing_channel_index is not None:
+        configured.append((config.fishing_channel_name, config.fishing_channel_index))
+    channels = {label.casefold(): index for label, index in configured}
+    name = channel.lstrip("#").casefold()
+    if name == "dm":
+        index = None
+    elif name in channels:
+        index = channels[name]
+    else:
+        print(f"Unknown channel {channel!r}; configured: "
+              f"{', '.join('#' + label for label, _ in configured)}, dm")
+        if name == config.fishing_channel_name.casefold():
+            print("#fishing is disabled: set fishing_channel_index in the config.")
+        return 2
+
+    with tempfile.TemporaryDirectory() as directory:
+        # Commands such as wx report write state; keep the real state file untouched.
+        state = Path(directory) / "state.json"
+        if config.state_file.exists():
+            state.write_bytes(config.state_file.read_bytes())
+        bot = WeatherBot(replace(config, state_file=state))
+        commands = SimulatedCommands(bot)
+        mesh = type("SimulatedMesh", (), {"commands": commands})()
+        if region is None:
+            region = bot._channel_region(index)
+        elif region.casefold() == "none":
+            region = None
+        now = datetime.now(tz=ZoneInfo("UTC"))
+        if index is None:
+            message = InboundMessage(
+                text, sender_prefix="000000000000", received_at=now,
+                sender_timestamp=int(now.timestamp()),
+            )
+
+            async def print_dm(_mesh: Any, _prefix: Any, chunk: str, *, api: bool = False) -> bool:
+                commands.sent += 1
+                print(f"--- DM reply, flood scope {'*' if api else '#' + REGION} "
+                      f"if flooded ---\n{chunk}", flush=True)
+                return True
+
+            bot.send_dm_with_fallback = print_dm
+            bot._has_contact = lambda *_args: _true()
+            where = "DM"
+        else:
+            message = InboundMessage(
+                f"Simulator: {text}", channel_index=index, region=region,
+                received_at=now, sender_timestamp=int(now.timestamp()),
+            )
+            where = f"#{channel.lstrip('#')} (channel {index})"
+        print(f"=== {text!r} on {where}, region {region or 'none'} ===", flush=True)
+        try:
+            handled = await bot.handle_message(mesh, message)
+        finally:
+            await bot.weather.close()
+            await bot.radar.close()
+            await bot.fishing.close()
+    if not handled:
+        print("=== ignored: the bot would not reply (see any log line above) ===")
+        return 1
+    print(f"=== handled: {commands.sent} message(s) would be sent ===")
+    return 0
+
+
+async def _true() -> bool:
+    return True
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     config = load_config(Path(args.config))
@@ -2434,6 +2559,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return asyncio.run(print_weather(config, args.weather))
     if args.fish:
         return asyncio.run(print_fishing(config, args.fish))
+    if args.simulate:
+        # Show why a message is ignored without the HTTP request noise.
+        LOG.setLevel(min(LOG.getEffectiveLevel(), logging.INFO))
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        return asyncio.run(
+            simulate_message(config, args.simulate, args.channel, args.region)
+        )
     try:
         asyncio.run(WeatherBot(config).run_forever())
     except KeyboardInterrupt:

@@ -205,6 +205,24 @@ Or print every fishing report for a ZIP:
 python weatherbot.py --config config.json --fish 70357
 ```
 
+To test commands on the bot host without transmitting anything, use `--simulate`. It
+runs the text through the same command handling as a mesh message, fetches live data,
+and prints each reply with the channel and flood scope it would use, or explains why
+the bot would ignore it. It never connects to the repeater, so it can run while the bot
+is running, and it works on a copy of the state file:
+
+```bash
+python weatherbot.py --config config.json --simulate "fish 70357"
+python weatherbot.py --config config.json --simulate "fish tide 70357" --region us-la-msy
+python weatherbot.py --config config.json --simulate "wx 70357" --channel Weather
+python weatherbot.py --config config.json --simulate "fish moon 70357" --channel dm
+```
+
+`--channel` is a configured channel name or `dm` (default `fishing`). `--region` defaults
+to the region that channel requires; pass another region, or `none`, to check that the
+message is ignored. The exit status is 0 when the bot would reply, 1 when it would ignore
+the message, and 2 when the channel is not configured.
+
 Run the unit tests:
 
 ```bash

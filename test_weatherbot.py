@@ -1329,6 +1329,9 @@ class FakeFishing:
     def __init__(self):
         self.calls = []
 
+    async def close(self):
+        pass
+
     def __getattr__(self, kind):
         if kind not in ("summary", "tides", "water", "wind", "moon"):
             raise AttributeError(kind)
@@ -1340,6 +1343,9 @@ class FakeFishing:
 
 
 class FakeFishingWeather(FakeBriefWeather):
+    async def close(self):
+        pass
+
     async def resolve_zip(self, zip_code):
         return weatherbot.Location(zip_code, 29.24, -89.99, "Grand Isle", "LA", None, None)
 
@@ -1566,3 +1572,60 @@ class FishingChannelTests(unittest.IsolatedAsyncioTestCase):
                     path.write_text(json.dumps({**base, **changes}), encoding="utf-8")
                     with self.assertRaisesRegex(SystemExit, error):
                         weatherbot.load_config(path)
+
+
+class SimulateTests(unittest.IsolatedAsyncioTestCase):
+    async def run_simulation(self, directory, text, channel="fishing", region=None, **changes):
+        changes.setdefault("fishing_channel_index", 4)
+        config = make_config(Path(directory) / "state.json", **changes)
+        output = []
+        with patch.object(weatherbot, "WeatherBot", self.make_bot_factory()), \
+                patch("builtins.print", lambda *args, **_kw: output.append(" ".join(map(str, args)))):
+            code = await weatherbot.simulate_message(config, text, channel, region)
+        return code, "\n".join(output)
+
+    def make_bot_factory(self):
+        real = weatherbot.WeatherBot
+
+        def factory(config):
+            return real(config, weather=FakeFishingWeather(), fishing=FakeFishing(),
+                        radar=AsyncMock())
+        return factory
+
+    async def test_fishing_reply_is_printed_with_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            code, output = await self.run_simulation(directory, "fish 70357")
+            self.assertEqual(code, 0)
+            self.assertIn("region us-la", output)
+            self.assertIn("reply on #fishing (channel 4), flood scope #us-la", output)
+            self.assertIn("summary Grand Isle, LA 70357", output)
+            self.assertIn("1 message(s) would be sent", output)
+
+    async def test_wrong_region_and_unscoped_are_ignored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for region in ("us-la-msy", "none"):
+                with self.subTest(region=region):
+                    with self.assertLogs("weatherbot", level="INFO") as logs:
+                        code, output = await self.run_simulation(directory, "fish 70357", region=region)
+                    self.assertEqual(code, 1)
+                    self.assertIn("ignored", output)
+                    self.assertIn("requires us-la", " ".join(logs.output))
+
+    async def test_disabled_channel_and_dm(self):
+        with tempfile.TemporaryDirectory() as directory:
+            code, output = await self.run_simulation(directory, "fish 70357", fishing_channel_index=None)
+            self.assertEqual(code, 2)
+            self.assertIn("#fishing is disabled", output)
+            self.assertIn("#Weather", output)
+            code, output = await self.run_simulation(directory, "fish moon 70357", channel="dm")
+            self.assertEqual(code, 0)
+            self.assertIn("DM reply", output)
+            self.assertIn("moon Grand Isle", output)
+
+    async def test_state_file_is_not_changed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state.json"
+            state.write_text("{}", encoding="utf-8")
+            code, _output = await self.run_simulation(directory, "wx report 70357", channel="dm")
+            self.assertEqual(code, 0)
+            self.assertEqual(state.read_text(encoding="utf-8"), "{}")
