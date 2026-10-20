@@ -1323,3 +1323,197 @@ class CommandFeatureTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FakeFishing:
+    def __init__(self):
+        self.calls = []
+
+    def __getattr__(self, kind):
+        if kind not in ("summary", "tides", "water", "wind", "moon"):
+            raise AttributeError(kind)
+
+        async def lookup(lat, lon, label):
+            self.calls.append((kind, lat, lon, label))
+            return f"🎣 {kind} {label}"
+        return lookup
+
+
+class FakeFishingWeather(FakeBriefWeather):
+    async def resolve_zip(self, zip_code):
+        return weatherbot.Location(zip_code, 29.24, -89.99, "Grand Isle", "LA", None, None)
+
+
+class FishingChannelTests(unittest.IsolatedAsyncioTestCase):
+    def make_bot(self, directory, **changes):
+        changes.setdefault("fishing_channel_index", 4)
+        return weatherbot.WeatherBot(
+            make_config(Path(directory) / "state.json", **changes),
+            weather=FakeFishingWeather(), fishing=FakeFishing(),
+        )
+
+    def test_us_la_transport_code(self):
+        frame = bytes.fromhex(RegionTests.FRAME)
+        key = weatherbot.hashlib.sha256(b"#us-la").digest()[:16]
+        digest = weatherbot.hmac.digest(key, bytes([5]) + frame[6:], "sha256")
+        code = int.from_bytes(digest[:2], "little")
+        us_la = (frame[:1] + code.to_bytes(2, "little") + frame[3:]).hex()
+        self.assertTrue(weatherbot.raw_region_match({"payload": us_la}, "us-la"))
+        self.assertFalse(weatherbot.raw_region_match({"payload": us_la}))
+        self.assertFalse(weatherbot.raw_region_match({"payload": RegionTests.FRAME}, "us-la"))
+        self.assertTrue(weatherbot.has_required_region(weatherbot.InboundMessage("x", region="#us-la"), "us-la"))
+        self.assertFalse(weatherbot.has_required_region(weatherbot.InboundMessage("x", region="us-la-msy"), "us-la"))
+
+    async def test_fishing_channel_requires_us_la_and_replies_scoped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot = self.make_bot(directory)
+            for region, status, accepted in (
+                ("us-la", None, True), (None, True, True), ("us-la-msy", None, False),
+                (None, None, False), ("us-la", False, False),
+            ):
+                with self.subTest(region=region, status=status):
+                    bot._seen_requests.clear()
+                    commands = FakeSetupCommands()
+                    handled = await bot.handle_message(FakeMesh(commands), weatherbot.InboundMessage(
+                        "Alice: fish 70357", channel_index=4, sender_timestamp=100,
+                        region=region, required_region_match=status,
+                    ))
+                    self.assertEqual(handled, accepted)
+                    if accepted:
+                        self.assertIn("summary Grand Isle, LA 70357", commands.channel_messages[0][1])
+                        self.assertEqual(set(commands.sent_scopes), {"#us-la"})
+                    else:
+                        self.assertFalse(commands.channel_messages)
+
+    async def test_subcommands_help_and_dedup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot = self.make_bot(directory)
+            for command, expected in (
+                ("fish tide 70357", "tides"), ("fish tides 70357-1234", "tides"),
+                ("FISH water 70357", "water"), ("fish wind 70357", "wind"),
+                ("fish moon 70357", "moon"), ("fish help", "#fishing commands"),
+                ("fish", "#fishing commands"),
+            ):
+                with self.subTest(command=command):
+                    commands = FakeSetupCommands()
+                    self.assertTrue(await bot.handle_message(FakeMesh(commands), weatherbot.InboundMessage(
+                        "Alice: " + command, channel_index=4, sender_timestamp=1, region="us-la",
+                    )))
+                    self.assertIn(expected, " ".join(text for _, text in commands.channel_messages))
+            commands = FakeSetupCommands()
+            message = weatherbot.InboundMessage("Alice: fish 70357", channel_index=4, sender_timestamp=7, region="us-la")
+            self.assertTrue(await bot.handle_message(FakeMesh(commands), message))
+            self.assertTrue(await bot.handle_message(FakeMesh(commands), message))
+            self.assertEqual(len([c for c in bot.fishing.calls if c[0] == "summary"]), 1)
+
+    async def test_lookup_errors_are_reported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot = self.make_bot(directory)
+
+            async def failing(*_args):
+                raise weatherbot.FishingError("no tide station within 50 mi")
+            bot.fishing = type("Failing", (), {"tides": staticmethod(failing)})()
+            commands = FakeSetupCommands()
+            self.assertTrue(await bot.handle_message(FakeMesh(commands), weatherbot.InboundMessage(
+                "Alice: fish tide 70357", channel_index=4, region="us-la",
+            )))
+            self.assertIn("FISH 70357: lookup failed: no tide station within 50 mi.", commands.channel_messages[0][1])
+
+    async def test_commands_stay_on_their_channels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot = self.make_bot(directory)
+            for command, channel, region in (
+                ("fish 70357", 1, "us-la-msy"), ("fish 70357", 2, "us-la-msy"),
+                ("fish 70357", 3, None), ("wx 70357", 4, "us-la"),
+                ("wx help", 4, "us-la"), ("ping", 4, "us-la"), ("bot json api", 4, "us-la"),
+                ("fish 70357 api2", 4, "us-la"),
+            ):
+                with self.subTest(command=command, channel=channel):
+                    commands = FakeSetupCommands()
+                    self.assertFalse(await bot.handle_message(FakeMesh(commands), weatherbot.InboundMessage(
+                        "Alice: " + command, channel_index=channel, region=region,
+                    )))
+                    self.assertFalse(commands.channel_messages)
+            # Weather keeps its own region, and DMs may use fish commands.
+            commands = FakeSetupCommands()
+            self.assertFalse(await bot.handle_message(FakeMesh(commands), weatherbot.InboundMessage(
+                "Alice: wx help", channel_index=1, region="us-la",
+            )))
+            bot._has_contact = AsyncMock(return_value=True)
+            bot.send_dm_with_fallback = AsyncMock()
+            self.assertTrue(await bot.handle_message(FakeMesh(FakeRoutingCommands()), weatherbot.InboundMessage(
+                "fish moon 70357", sender_prefix="aabbccddeeff",
+            )))
+            self.assertIn("moon Grand Isle", bot.send_dm_with_fallback.call_args.args[2])
+
+    async def test_disabled_by_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot = self.make_bot(directory, fishing_channel_index=None)
+            commands = FakeSetupCommands()
+            self.assertFalse(await bot.handle_message(FakeMesh(commands), weatherbot.InboundMessage(
+                "Alice: fish 70357", channel_index=4, region="us-la",
+            )))
+            await bot._prepare_mesh(FakeMesh(commands))
+            self.assertNotIn(("get_channel", 4), commands.calls)
+            self.assertNotIn("#us-la", commands.scope_calls)
+
+    async def test_raw_log_uses_fishing_region(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot = self.make_bot(directory)
+            event = dict(chan_name="fishing", sender_timestamp=100, message="Alice: fish 70357",
+                         path="", path_hash_size=1, payload=RegionTests.FRAME)
+            bot._remember_raw_channel_event(event)
+            message = bot._attach_raw_channel_path(weatherbot.InboundMessage(
+                "Alice: fish 70357", channel_index=4, sender_timestamp=100, region="us-la",
+            ))
+            # A us-la-msy packet proves the wrong region even if the companion claims us-la.
+            self.assertFalse(message.required_region_match)
+            self.assertFalse(await bot.handle_message(FakeMesh(FakeSetupCommands()), message))
+
+    async def test_setup_verifies_channel_and_probes_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            key = base64.b64encode(b"k" * 16).decode()
+            bot = self.make_bot(directory, fishing_channel_key=key)
+
+            class Commands(FakeSetupCommands):
+                def __init__(self, name):
+                    super().__init__()
+                    self.name = name
+
+                async def get_channel(self, index):
+                    event = await super().get_channel(index)
+                    if index == 4:
+                        event.payload["channel_name"] = self.name
+                    return event
+
+            commands = Commands("#Fishing")
+            await bot._prepare_mesh(FakeMesh(commands))
+            self.assertIn(("set_channel", 4, "fishing", b"k" * 16), commands.calls)
+            self.assertEqual(commands.scope_calls[:6], ["#us-la-msy", None, "*", None, "#us-la", None])
+            with self.assertRaisesRegex(weatherbot.MeshError, "channel 4 is 'test', not 'fishing'"):
+                await self.make_bot(directory)._prepare_mesh(FakeMesh(Commands("test")))
+
+    def test_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            base = {"noaa_user_agent": "weatherbot-tests (tests@example.com)"}
+            path.write_text(json.dumps(base), encoding="utf-8")
+            config = weatherbot.load_config(path)
+            self.assertIsNone(config.fishing_channel_index)
+            self.assertEqual(config.fishing_region, "us-la")
+            path.write_text(json.dumps({**base, "fishing_channel_index": 4,
+                                        "fishing_channel_name": "#fishing",
+                                        "fishing_region": "#us-la"}), encoding="utf-8")
+            config = weatherbot.load_config(path)
+            self.assertEqual((config.fishing_channel_index, config.fishing_channel_name,
+                              config.fishing_region), (4, "fishing", "us-la"))
+            for changes, error in (
+                ({"fishing_channel_index": 1}, "must differ"),
+                ({"fishing_channel_index": 40}, "between 0 and 39"),
+                ({"fishing_channel_index": 4, "fishing_region": ""}, "fishing_region"),
+                ({"fishing_channel_index": 4, "fishing_channel_key": "bad"}, ""),
+            ):
+                with self.subTest(changes=changes):
+                    path.write_text(json.dumps({**base, **changes}), encoding="utf-8")
+                    with self.assertRaisesRegex(SystemExit, error):
+                        weatherbot.load_config(path)
