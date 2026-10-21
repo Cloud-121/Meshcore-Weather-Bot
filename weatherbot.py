@@ -28,7 +28,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 import api_v2
-from fishing import FISH_HELP_TEXT, FishingError, FishingService
+from fishing import FISH_HELP_TEXT, FishingError, FishingService, shorten
 from radar import RadarError, RadarService, parse_radar_request
 from meshcore import EventType, MeshCore
 
@@ -51,6 +51,10 @@ FISH_COMMAND = re.compile(
 FISH_HELP_COMMAND = re.compile(r"\s*fish(?:\s+help)?\s*", re.IGNORECASE)
 REGION = "us-la-msy"
 BOT_COMMAND_WORD = re.compile(r"\s*(?:wx|fish|ping|bot)\b", re.IGNORECASE)
+REGION_REQUIRED_TEXT = (
+    'Fishing commands need the "{region}" region code. '
+    "Set your region to {region} and try again."
+)
 RAW_PATH_CACHE_SECONDS = 10.0
 RAW_PATH_CACHE_LIMIT = 128
 HELP_TEXT = (
@@ -149,7 +153,7 @@ class BotConfig:
     fishing_channel_index: Optional[int] = None
     fishing_channel_name: str = "fishing"
     fishing_channel_key: str = ""
-    fishing_region: str = "us-la"
+    fishing_region: str = "us-gc"
 
 
 class WeatherService:
@@ -873,7 +877,7 @@ class WeatherBot:
         region = self._channel_region(message.channel_index)
         if region is not None and not has_required_region(message, region):
             if BOT_COMMAND_WORD.match(command_text(message.text, True)):
-                # No reply is sent, so say why for whoever runs the bot.
+                # Say why for whoever runs the bot; only #fishing tells the sender.
                 LOG.info(
                     "Ignoring command on channel %d: region %s, requires %s",
                     message.channel_index,
@@ -883,6 +887,8 @@ class WeatherBot:
                     else repr(message.region),
                     region,
                 )
+                if message.channel_index == self.config.fishing_channel_index:
+                    return await self._reply_region_required(mesh, message, region)
             return False
         command = command_text(message.text, message.is_channel)
         # Explicit opt-in only; the original message remains the deduplication key.
@@ -1123,13 +1129,29 @@ class WeatherBot:
         )
         try:
             location = await self.weather.resolve_zip(zip_code)
-            label = f"{location.city}, {location.state} {location.zip_code}"
+            label = fishing_label(location)
             report = await getattr(self.fishing, kind)(
                 location.latitude, location.longitude, label
             )
         except (WeatherError, FishingError) as exc:
             report = f"FISH {zip_code}: lookup failed: {exc}."
         await self._reply(mesh, message, report)
+
+    async def _reply_region_required(
+        self, mesh: Any, message: InboundMessage, region: str
+    ) -> bool:
+        """Tell a #fishing sender which region code their command needs."""
+        request_key = self._request_key(message)
+        if request_key is not None:
+            if self._is_seen(request_key):
+                return True
+            self._note_seen(request_key)
+        # Use the bot's usual scope: the sender is not on the required one yet.
+        await self.send_channel(
+            mesh, REGION_REQUIRED_TEXT.format(region=region),
+            message.channel_index, region=REGION,
+        )
+        return True
 
     async def _reply(
         self, mesh: Any, message: InboundMessage, response: str | dict[str, Any]
@@ -1248,10 +1270,11 @@ class WeatherBot:
                     raise
 
     async def send_channel(
-        self, mesh: Any, text: str, channel_index: Optional[int] = None, *, api: bool = False
+        self, mesh: Any, text: str, channel_index: Optional[int] = None, *,
+        api: bool = False, region: Optional[str] = None,
     ) -> None:
         channel_index = self.config.weather_channel_index if channel_index is None else channel_index
-        region = self._channel_region(channel_index) or REGION
+        region = region or self._channel_region(channel_index) or REGION
         async with self._mesh_lock, self._flood_scope_unlocked(mesh, api=api, region=region):
             self._require_event(
                 await mesh.commands.send_chan_msg(channel_index, text),
@@ -2310,7 +2333,7 @@ def load_config(path: Path) -> BotConfig:
         ),
         fishing_channel_name=str(raw.get("fishing_channel_name", "fishing")).lstrip("#"),
         fishing_channel_key=str(raw.get("fishing_channel_key", "")),
-        fishing_region=str(raw.get("fishing_region", "us-la")).strip().lstrip("#"),
+        fishing_region=str(raw.get("fishing_region", "us-gc")).strip().lstrip("#"),
     )
     if not 1 <= config.repeater_port <= 65535:
         raise SystemExit("repeater_port must be between 1 and 65535")
@@ -2420,12 +2443,18 @@ async def print_weather(config: BotConfig, zip_code: str) -> int:
         await service.close()
 
 
+def fishing_label(location: Location) -> str:
+    """Short header for fishing replies; the ZIP already identifies the place."""
+    city = shorten(location.city, 20)
+    return f"{city} {location.zip_code}" if city != location.zip_code else city
+
+
 async def print_fishing(config: BotConfig, zip_code: str) -> int:
     weather = WeatherService(config.noaa_user_agent, config.http_timeout_seconds)
     fishing = FishingService(config.noaa_user_agent, config.http_timeout_seconds)
     try:
         location = await weather.resolve_zip(zip_code)
-        label = f"{location.city}, {location.state} {location.zip_code}"
+        label = fishing_label(location)
         for kind in ("summary", "tides", "water", "wind", "moon"):
             try:
                 print(await getattr(fishing, kind)(location.latitude, location.longitude, label))

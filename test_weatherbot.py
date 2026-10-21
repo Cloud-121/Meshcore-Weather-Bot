@@ -1358,24 +1358,24 @@ class FishingChannelTests(unittest.IsolatedAsyncioTestCase):
             weather=FakeFishingWeather(), fishing=FakeFishing(),
         )
 
-    def test_us_la_transport_code(self):
+    def test_us_gc_transport_code(self):
         frame = bytes.fromhex(RegionTests.FRAME)
-        key = weatherbot.hashlib.sha256(b"#us-la").digest()[:16]
+        key = weatherbot.hashlib.sha256(b"#us-gc").digest()[:16]
         digest = weatherbot.hmac.digest(key, bytes([5]) + frame[6:], "sha256")
         code = int.from_bytes(digest[:2], "little")
-        us_la = (frame[:1] + code.to_bytes(2, "little") + frame[3:]).hex()
-        self.assertTrue(weatherbot.raw_region_match({"payload": us_la}, "us-la"))
-        self.assertFalse(weatherbot.raw_region_match({"payload": us_la}))
-        self.assertFalse(weatherbot.raw_region_match({"payload": RegionTests.FRAME}, "us-la"))
-        self.assertTrue(weatherbot.has_required_region(weatherbot.InboundMessage("x", region="#us-la"), "us-la"))
-        self.assertFalse(weatherbot.has_required_region(weatherbot.InboundMessage("x", region="us-la-msy"), "us-la"))
+        us_gc = (frame[:1] + code.to_bytes(2, "little") + frame[3:]).hex()
+        self.assertTrue(weatherbot.raw_region_match({"payload": us_gc}, "us-gc"))
+        self.assertFalse(weatherbot.raw_region_match({"payload": us_gc}))
+        self.assertFalse(weatherbot.raw_region_match({"payload": RegionTests.FRAME}, "us-gc"))
+        self.assertTrue(weatherbot.has_required_region(weatherbot.InboundMessage("x", region="#us-gc"), "us-gc"))
+        self.assertFalse(weatherbot.has_required_region(weatherbot.InboundMessage("x", region="us-la-msy"), "us-gc"))
 
-    async def test_fishing_channel_requires_us_la_and_replies_scoped(self):
+    async def test_fishing_channel_requires_us_gc_and_replies_scoped(self):
         with tempfile.TemporaryDirectory() as directory:
             bot = self.make_bot(directory)
             for region, status, accepted in (
-                ("us-la", None, True), (None, True, True), ("us-la-msy", None, False),
-                (None, None, False), ("us-la", False, False),
+                ("us-gc", None, True), (None, True, True), ("us-la-msy", None, False),
+                (None, None, False), ("us-gc", False, False), ("us-la", None, False),
             ):
                 with self.subTest(region=region, status=status):
                     bot._seen_requests.clear()
@@ -1384,20 +1384,40 @@ class FishingChannelTests(unittest.IsolatedAsyncioTestCase):
                         "Alice: fish 70357", channel_index=4, sender_timestamp=100,
                         region=region, required_region_match=status,
                     ))
-                    self.assertEqual(handled, accepted)
+                    self.assertTrue(handled)
                     if accepted:
-                        self.assertIn("summary Grand Isle, LA 70357", commands.channel_messages[0][1])
-                        self.assertEqual(set(commands.sent_scopes), {"#us-la"})
+                        self.assertIn("summary Grand Isle 70357", commands.channel_messages[0][1])
+                        self.assertEqual(set(commands.sent_scopes), {"#us-gc"})
                     else:
-                        self.assertFalse(commands.channel_messages)
+                        # The sender is told which region to use, in the bot's usual scope.
+                        self.assertEqual(commands.channel_messages, [
+                            (4, weatherbot.REGION_REQUIRED_TEXT.format(region="us-gc")),
+                        ])
+                        self.assertEqual(commands.sent_scopes, ["#us-la-msy"])
+
+    async def test_region_notice_is_deduplicated_and_skips_chat(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot = self.make_bot(directory)
+            commands = FakeSetupCommands()
+            message = weatherbot.InboundMessage(
+                "Alice: fish 70357", channel_index=4, sender_timestamp=100, region="us-la-msy",
+            )
+            self.assertTrue(await bot.handle_message(FakeMesh(commands), message))
+            self.assertTrue(await bot.handle_message(FakeMesh(commands), message))
+            self.assertEqual(len(commands.channel_messages), 1)
+            commands = FakeSetupCommands()
+            self.assertFalse(await bot.handle_message(FakeMesh(commands), weatherbot.InboundMessage(
+                "Alice: catching reds today", channel_index=4, region="us-la-msy",
+            )))
+            self.assertFalse(commands.channel_messages)
 
     async def test_ignored_commands_are_logged(self):
         with tempfile.TemporaryDirectory() as directory:
             bot = self.make_bot(directory)
             for region, status, reason in (
-                ("us-la-msy", None, "region 'us-la-msy', requires us-la"),
-                (None, None, "region unverified, requires us-la"),
-                ("us-la", False, "region mismatch, requires us-la"),
+                ("us-la-msy", None, "region 'us-la-msy', requires us-gc"),
+                (None, None, "region unverified, requires us-gc"),
+                ("us-gc", False, "region mismatch, requires us-gc"),
             ):
                 with self.subTest(region=region, status=status):
                     with self.assertLogs("weatherbot", level="INFO") as logs:
@@ -1418,17 +1438,17 @@ class FishingChannelTests(unittest.IsolatedAsyncioTestCase):
             for command, expected in (
                 ("fish tide 70357", "tides"), ("fish tides 70357-1234", "tides"),
                 ("FISH water 70357", "water"), ("fish wind 70357", "wind"),
-                ("fish moon 70357", "moon"), ("fish help", "#fishing commands"),
-                ("fish", "#fishing commands"),
+                ("fish moon 70357", "moon"), ("fish help", "More detail: fish tide|water|wind|moon ZIP"),
+                ("fish", "More detail"),
             ):
                 with self.subTest(command=command):
                     commands = FakeSetupCommands()
                     self.assertTrue(await bot.handle_message(FakeMesh(commands), weatherbot.InboundMessage(
-                        "Alice: " + command, channel_index=4, sender_timestamp=1, region="us-la",
+                        "Alice: " + command, channel_index=4, sender_timestamp=1, region="us-gc",
                     )))
                     self.assertIn(expected, " ".join(text for _, text in commands.channel_messages))
             commands = FakeSetupCommands()
-            message = weatherbot.InboundMessage("Alice: fish 70357", channel_index=4, sender_timestamp=7, region="us-la")
+            message = weatherbot.InboundMessage("Alice: fish 70357", channel_index=4, sender_timestamp=7, region="us-gc")
             self.assertTrue(await bot.handle_message(FakeMesh(commands), message))
             self.assertTrue(await bot.handle_message(FakeMesh(commands), message))
             self.assertEqual(len([c for c in bot.fishing.calls if c[0] == "summary"]), 1)
@@ -1442,7 +1462,7 @@ class FishingChannelTests(unittest.IsolatedAsyncioTestCase):
             bot.fishing = type("Failing", (), {"tides": staticmethod(failing)})()
             commands = FakeSetupCommands()
             self.assertTrue(await bot.handle_message(FakeMesh(commands), weatherbot.InboundMessage(
-                "Alice: fish tide 70357", channel_index=4, region="us-la",
+                "Alice: fish tide 70357", channel_index=4, region="us-gc",
             )))
             self.assertIn("FISH 70357: lookup failed: no tide station within 50 mi.", commands.channel_messages[0][1])
 
@@ -1451,9 +1471,9 @@ class FishingChannelTests(unittest.IsolatedAsyncioTestCase):
             bot = self.make_bot(directory)
             for command, channel, region in (
                 ("fish 70357", 1, "us-la-msy"), ("fish 70357", 2, "us-la-msy"),
-                ("fish 70357", 3, None), ("wx 70357", 4, "us-la"),
-                ("wx help", 4, "us-la"), ("ping", 4, "us-la"), ("bot json api", 4, "us-la"),
-                ("fish 70357 api2", 4, "us-la"),
+                ("fish 70357", 3, None), ("wx 70357", 4, "us-gc"),
+                ("wx help", 4, "us-gc"), ("ping", 4, "us-gc"), ("bot json api", 4, "us-gc"),
+                ("fish 70357 api2", 4, "us-gc"),
             ):
                 with self.subTest(command=command, channel=channel):
                     commands = FakeSetupCommands()
@@ -1464,25 +1484,25 @@ class FishingChannelTests(unittest.IsolatedAsyncioTestCase):
             # Weather keeps its own region, and DMs may use fish commands.
             commands = FakeSetupCommands()
             self.assertFalse(await bot.handle_message(FakeMesh(commands), weatherbot.InboundMessage(
-                "Alice: wx help", channel_index=1, region="us-la",
+                "Alice: wx help", channel_index=1, region="us-gc",
             )))
             bot._has_contact = AsyncMock(return_value=True)
             bot.send_dm_with_fallback = AsyncMock()
             self.assertTrue(await bot.handle_message(FakeMesh(FakeRoutingCommands()), weatherbot.InboundMessage(
                 "fish moon 70357", sender_prefix="aabbccddeeff",
             )))
-            self.assertIn("moon Grand Isle", bot.send_dm_with_fallback.call_args.args[2])
+            self.assertIn("moon Grand Isle 70357", bot.send_dm_with_fallback.call_args.args[2])
 
     async def test_disabled_by_default(self):
         with tempfile.TemporaryDirectory() as directory:
             bot = self.make_bot(directory, fishing_channel_index=None)
             commands = FakeSetupCommands()
             self.assertFalse(await bot.handle_message(FakeMesh(commands), weatherbot.InboundMessage(
-                "Alice: fish 70357", channel_index=4, region="us-la",
+                "Alice: fish 70357", channel_index=4, region="us-gc",
             )))
             await bot._prepare_mesh(FakeMesh(commands))
             self.assertNotIn(("get_channel", 4), commands.calls)
-            self.assertNotIn("#us-la", commands.scope_calls)
+            self.assertNotIn("#us-gc", commands.scope_calls)
 
     async def test_raw_log_uses_fishing_region(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1491,11 +1511,14 @@ class FishingChannelTests(unittest.IsolatedAsyncioTestCase):
                          path="", path_hash_size=1, payload=RegionTests.FRAME)
             bot._remember_raw_channel_event(event)
             message = bot._attach_raw_channel_path(weatherbot.InboundMessage(
-                "Alice: fish 70357", channel_index=4, sender_timestamp=100, region="us-la",
+                "Alice: fish 70357", channel_index=4, sender_timestamp=100, region="us-gc",
             ))
-            # A us-la-msy packet proves the wrong region even if the companion claims us-la.
+            # A us-la-msy packet proves the wrong region even if the companion claims us-gc.
             self.assertFalse(message.required_region_match)
-            self.assertFalse(await bot.handle_message(FakeMesh(FakeSetupCommands()), message))
+            commands = FakeSetupCommands()
+            self.assertTrue(await bot.handle_message(FakeMesh(commands), message))
+            self.assertIn("us-gc", commands.channel_messages[0][1])
+            self.assertNotIn("Grand Isle", commands.channel_messages[0][1])
 
     async def test_setup_adds_fishing_channel(self):
         class Commands(FakeSetupCommands):
@@ -1521,7 +1544,7 @@ class FishingChannelTests(unittest.IsolatedAsyncioTestCase):
             commands = Commands("")
             await self.make_bot(directory)._prepare_mesh(FakeMesh(commands))
             self.assertIn(("set_channel", 4, "#fishing", None), commands.calls)
-            self.assertEqual(commands.scope_calls[:6], ["#us-la-msy", None, "*", None, "#us-la", None])
+            self.assertEqual(commands.scope_calls[:6], ["#us-la-msy", None, "*", None, "#us-gc", None])
             self.assertIn(("send_advert", True), commands.calls)
 
             # An existing #fishing channel is left alone.
@@ -1555,13 +1578,13 @@ class FishingChannelTests(unittest.IsolatedAsyncioTestCase):
             path.write_text(json.dumps(base), encoding="utf-8")
             config = weatherbot.load_config(path)
             self.assertIsNone(config.fishing_channel_index)
-            self.assertEqual(config.fishing_region, "us-la")
+            self.assertEqual(config.fishing_region, "us-gc")
             path.write_text(json.dumps({**base, "fishing_channel_index": 4,
                                         "fishing_channel_name": "#fishing",
-                                        "fishing_region": "#us-la"}), encoding="utf-8")
+                                        "fishing_region": "#us-gc"}), encoding="utf-8")
             config = weatherbot.load_config(path)
             self.assertEqual((config.fishing_channel_index, config.fishing_channel_name,
-                              config.fishing_region), (4, "fishing", "us-la"))
+                              config.fishing_region), (4, "fishing", "us-gc"))
             for changes, error in (
                 ({"fishing_channel_index": 1}, "must differ"),
                 ({"fishing_channel_index": 40}, "between 0 and 39"),
@@ -1596,20 +1619,22 @@ class SimulateTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             code, output = await self.run_simulation(directory, "fish 70357")
             self.assertEqual(code, 0)
-            self.assertIn("region us-la", output)
-            self.assertIn("reply on #fishing (channel 4), flood scope #us-la", output)
-            self.assertIn("summary Grand Isle, LA 70357", output)
+            self.assertIn("region us-gc", output)
+            self.assertIn("reply on #fishing (channel 4), flood scope #us-gc", output)
+            self.assertIn("summary Grand Isle 70357", output)
             self.assertIn("1 message(s) would be sent", output)
 
-    async def test_wrong_region_and_unscoped_are_ignored(self):
+    async def test_wrong_region_and_unscoped_get_region_notice(self):
         with tempfile.TemporaryDirectory() as directory:
-            for region in ("us-la-msy", "none"):
+            for region in ("us-la-msy", "us-la", "none"):
                 with self.subTest(region=region):
                     with self.assertLogs("weatherbot", level="INFO") as logs:
                         code, output = await self.run_simulation(directory, "fish 70357", region=region)
-                    self.assertEqual(code, 1)
-                    self.assertIn("ignored", output)
-                    self.assertIn("requires us-la", " ".join(logs.output))
+                    self.assertEqual(code, 0)
+                    self.assertIn('need the "us-gc" region code', output)
+                    self.assertIn("flood scope #us-la-msy", output)
+                    self.assertNotIn("summary Grand Isle", output)
+                    self.assertIn("requires us-gc", " ".join(logs.output))
 
     async def test_disabled_channel_and_dm(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1620,7 +1645,7 @@ class SimulateTests(unittest.IsolatedAsyncioTestCase):
             code, output = await self.run_simulation(directory, "fish moon 70357", channel="dm")
             self.assertEqual(code, 0)
             self.assertIn("DM reply", output)
-            self.assertIn("moon Grand Isle", output)
+            self.assertIn("moon Grand Isle 70357", output)
 
     async def test_state_file_is_not_changed(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1629,3 +1654,12 @@ class SimulateTests(unittest.IsolatedAsyncioTestCase):
             code, _output = await self.run_simulation(directory, "wx report 70357", channel="dm")
             self.assertEqual(code, 0)
             self.assertEqual(state.read_text(encoding="utf-8"), "{}")
+
+
+class FishingLabelTests(unittest.TestCase):
+    def test_label_is_short(self):
+        def label(city):
+            return weatherbot.fishing_label(weatherbot.Location("70357", 0, 0, city, "LA", None, None))
+        self.assertEqual(label("Golden Meadow"), "Golden Meadow 70357")
+        self.assertEqual(label("Saint Martinville East"), "Saint Martinville 70357")
+        self.assertEqual(label("70357"), "70357")

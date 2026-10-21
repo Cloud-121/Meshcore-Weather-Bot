@@ -17,7 +17,7 @@
   "fishing_channel_index": 4,
   "fishing_channel_name": "fishing",
   "fishing_channel_key": "",
-  "fishing_region": "us-la",
+  "fishing_region": "us-gc",
 
   "alert_zip_codes": ["60601", "63101"],
   "alert_poll_seconds": 60,

@@ -172,18 +172,18 @@ class FishingServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_coastal_summary(self):
         self.service = make_service(FakeFishingApis())
-        text = await self.service.summary(*GRAND_ISLE, "Grand Isle, LA 70357")
-        self.assertIn("🎣 Grand Isle, LA 70357", text)
-        self.assertIn("H ", text)
-        self.assertIn("1.3ft · L ", text)
-        self.assertIn("(Grand Isle)", text)
-        self.assertIn("Water 78°F", text)
-        self.assertIn("Air 82°F", text)
-        self.assertIn("Waves 2.1ft 5s", text)
-        self.assertIn("SE 12 G18mph", text)
-        self.assertIn('29.85" falling', text)
-        self.assertIn("🐟 Major", text)
-        for chunk in weatherbot.split_mesh_text(text):
+        text = await self.service.summary(*GRAND_ISLE, "Grand Isle 70357")
+        lines = text.split("\n")
+        self.assertEqual(lines[0], "🎣 Grand Isle 70357")
+        self.assertRegex(lines[1], r"^🌊 H \d+:\d\d[ap] 1\.3 L \d+:\d\d[ap] 0\.2ft$")
+        self.assertEqual(lines[2], "Water 78°F · Waves 2.1ft")
+        self.assertEqual(lines[3], "💨 SE 12 G18mph · 29.85 falling")
+        self.assertRegex(lines[4], r"^🌅 \S+ 🌇 \S+ \S+ \d+%$")
+        self.assertTrue(lines[5].startswith("🐟 Major "))
+        self.assertNotIn("Air", text)
+        chunks = weatherbot.split_mesh_text(text)
+        self.assertLessEqual(len(chunks), 2)
+        for chunk in chunks:
             self.assertLessEqual(len(chunk.encode()), 140)
 
     async def test_inland_summary_omits_tides_and_waves(self):
@@ -192,7 +192,7 @@ class FishingServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("🌊", text)
         self.assertNotIn("Waves", text)
         self.assertNotIn("Water", text)
-        self.assertIn("Air 82°F", text)
+        self.assertIn("💨 SE 12 G18mph", text)
         with self.assertRaisesRegex(fishing.FishingError, "no tide station within 50 mi"):
             await self.service.tides(41.88, -87.62, "Chicago, IL 60601")
         with self.assertRaisesRegex(fishing.FishingError, "no water data"):
@@ -209,24 +209,52 @@ class FishingServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_subcommands(self):
         apis = FakeFishingApis(water_missing_first=True)
         self.service = make_service(apis)
-        tides = await self.service.tides(*GRAND_ISLE, "Grand Isle, LA 70357")
-        self.assertEqual(tides.count("ft"), 6)
-        self.assertIn("MLLW", tides)
-        water = await self.service.water(*GRAND_ISLE, "Grand Isle, LA 70357")
+        tides = await self.service.tides(*GRAND_ISLE, "Grand Isle 70357")
+        lines = tides.split("\n")
+        self.assertEqual(lines[1], "Grand Isle 3mi, ft")
+        self.assertEqual(len(lines), 8)
+        self.assertRegex(lines[2], r"^H \d+:\d\d[ap] 1\.3$")
+        self.assertRegex(tides, r"\n[A-Z][a-z]{2} [HL] ")
+        water = await self.service.water(*GRAND_ISLE, "Grand Isle 70357")
         # The nearest sensor has no data, so the next one is used.
-        self.assertIn("78.4°F Grand Isle", water)
-        self.assertIn("Sea surface 79°F", water)
-        self.assertIn("Waves 2.1ft 5s from SE", water)
-        wind = await self.service.wind(*GRAND_ISLE, "Grand Isle, LA 70357")
+        self.assertIn("78°F Grand Isle 3mi", water)
+        self.assertNotIn("sea surface", water)
+        self.assertIn("Waves 2.1ft every 5s from SE", water)
+        wind = await self.service.wind(*GRAND_ISLE, "Grand Isle 70357")
         self.assertIn("Now SE 12 G18mph", wind)
-        self.assertIn('Pressure 29.85" falling (-0.06/3h)', wind)
-        self.assertIn("+6h SE 18 G24mph", wind)
-        moon = await self.service.moon(*GRAND_ISLE, "Grand Isle, LA 70357")
-        self.assertIn("Sun ", moon)
-        self.assertIn("Major ", moon)
-        for text in (tides, water, wind, moon):
-            for chunk in weatherbot.split_mesh_text(text):
-                self.assertLessEqual(len(chunk.encode()), 140)
+        self.assertIn("Pressure 29.85inHg falling -0.06/3h", wind)
+        self.assertIn("+2h SE 14 G20 · +4h SE 16 G22\n+6h SE 18 G24", wind)
+        moon = await self.service.moon(*GRAND_ISLE, "Grand Isle 70357")
+        self.assertIn("🌅 ", moon)
+        self.assertIn("\nMajor ", moon)
+        self.assertNotIn("Moonrise", moon)
+        for text in (tides, water, wind, moon, fishing.FISH_HELP_TEXT):
+            self.assertEqual(len(weatherbot.split_mesh_text(text)), 1, text)
+
+    async def test_tides_stop_at_one_message(self):
+        apis = FakeFishingApis()
+        self.service = make_service(apis)
+        handler = apis.handler
+
+        def many_events(request):
+            response = handler(request)
+            if dict(request.url.params).get("product") == "predictions":
+                events = response.json()["predictions"]
+                return httpx.Response(200, json={"predictions": events * 3})
+            return response
+        self.service.client = httpx.AsyncClient(transport=httpx.MockTransport(many_events))
+        tides = await self.service.tides(*GRAND_ISLE, "A Long Place Name 70357")
+        self.assertLessEqual(len(tides.encode()), fishing.MESSAGE_BYTES)
+        self.assertEqual(len(weatherbot.split_mesh_text(tides)), 1)
+
+    async def test_sea_surface_fallback(self):
+        apis = FakeFishingApis()
+        self.service = make_service(apis)
+        self.service._stations["watertemp"] = (time.monotonic(), [])
+        water = await self.service.water(*GRAND_ISLE, "Grand Isle 70357")
+        self.assertIn("79°F sea surface", water)
+        summary = await self.service.summary(*GRAND_ISLE, "Grand Isle 70357")
+        self.assertIn("Water 79°F", summary)
 
     async def test_service_errors_are_reportable(self):
         self.service = fishing.FishingService("fishing-tests", timeout=1)

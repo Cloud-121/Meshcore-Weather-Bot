@@ -21,6 +21,8 @@ WATER_MAX_AGE = timedelta(hours=6)
 # Geocentric lunar rise/set altitude: parallax (0.7275 * 57') minus refraction (34').
 MOON_HORIZON = 0.125
 PRESSURE_TREND_INHG = 0.03
+# Text that fits one mesh message alongside a "[1/2] " part number.
+MESSAGE_BYTES = 130
 HPA_TO_INHG = 0.0295299830714
 PHASES = (
     ("New moon", "🌑"), ("Waxing crescent", "🌒"), ("First quarter", "🌓"),
@@ -29,12 +31,8 @@ PHASES = (
 )
 COMPASS = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
 FISH_HELP_TEXT = (
-    "🎣 #fishing commands\n"
-    "fish ZIP: summary\n"
-    "fish tide ZIP: tides 36h\n"
-    "fish water ZIP: water temp, waves\n"
-    "fish wind ZIP: wind, pressure\n"
-    "fish moon ZIP: sun, moon, solunar"
+    "🎣 fish ZIP: tides, water, wind, sun, moon, best times\n"
+    "More detail: fish tide|water|wind|moon ZIP"
 )
 
 
@@ -164,44 +162,37 @@ class FishingService:
         if isinstance(forecast, BaseException) and isinstance(tides, BaseException):
             raise forecast if isinstance(forecast, FishingError) else FishingError(
                 "data service is unavailable")
-        tz = await self._timezone(lat, lon) if not isinstance(forecast, BaseException) else ZoneInfo("UTC")
+        has_forecast = not isinstance(forecast, BaseException)
+        tz = await self._timezone(lat, lon) if has_forecast else ZoneInfo("UTC")
+        now = datetime.now(timezone.utc)
         lines = [f"🎣 {label}"]
         if not isinstance(tides, BaseException):
-            station, _miles, events = tides
-            parts = [f"{kind} {clock(when, tz)} {height:.1f}ft" for when, kind, height in events[:2]]
-            lines.append(f"🌊 {' · '.join(parts)} ({short_name(station)})")
-        temps = []
-        now = datetime.now(timezone.utc)
+            lines.append("🌊 " + " ".join(
+                f"{kind} {clock(when, tz)} {height:.1f}" for when, kind, height in tides[2][:2]
+            ) + "ft")
+        water_parts = []
         if not isinstance(water, BaseException) and water and now - water[1] <= WATER_MAX_AGE:
-            temps.append(f"Water {round(water[0])}°F")
-        elif not isinstance(marine, BaseException) and number(marine.get("sea_surface_temperature")) is not None:
-            temps.append(f"Sea {round(c_to_f(number(marine['sea_surface_temperature'])))}°F")
-        if not isinstance(forecast, BaseException):
-            air = number(forecast["current"].get("temperature_2m"))
-            if air is not None:
-                temps.append(f"Air {round(air)}°F")
+            water_parts.append(f"Water {round(water[0])}°F")
+        elif not isinstance(marine, BaseException):
+            sst = number(marine.get("sea_surface_temperature"))
+            if sst is not None:
+                water_parts.append(f"Water {round(c_to_f(sst))}°F")
         if not isinstance(marine, BaseException):
-            waves = wave_text(marine)
-            if waves:
-                temps.append(f"Waves {waves}")
-        if temps:
-            lines.append(f"🌡️ {' · '.join(temps)}")
-        if not isinstance(forecast, BaseException):
-            current = forecast["current"]
-            wind = wind_text(current)
+            height = number(marine.get("wave_height"))
+            if height is not None:
+                water_parts.append(f"Waves {height:.1f}ft")
+        if water_parts:
+            lines.append(" · ".join(water_parts))
+        if has_forecast:
+            wind = wind_text(forecast["current"])
             pressure = pressure_text(forecast)
             if wind or pressure:
                 lines.append("💨 " + " · ".join(part for part in (wind, pressure) if part))
-            sun = sun_times(forecast, tz)
-        else:
-            sun = None
-        name, emoji, lit = moon_phase(now)
-        lines.append(" · ".join(part for part in (
-            f"🌅 {clock(sun[0], tz)}-{clock(sun[1], tz)}" if sun else "",
-            f"{emoji} {lit}%",
-        ) if part))
-        periods = solunar_periods(now.astimezone(tz).date(), lat, lon, tz)
-        solunar = solunar_text(periods, tz)
+        sun = sun_times(forecast, tz) if has_forecast else None
+        _name, emoji, lit = moon_phase(now)
+        sky = [f"🌅 {clock(sun[0], tz)} 🌇 {clock(sun[1], tz)}"] if sun else []
+        lines.append(" ".join(sky + [f"{emoji} {lit}%"]))
+        solunar = solunar_text(solunar_periods(now.astimezone(tz).date(), lat, lon, tz), tz)
         if solunar:
             lines.append(f"🐟 {solunar}")
         return "\n".join(lines)
@@ -209,12 +200,16 @@ class FishingService:
     async def tides(self, lat: float, lon: float, label: str) -> str:
         station, miles, events = await self._tide_events(lat, lon, 36)
         tz = await self._timezone(lat, lon)
-        lines = [f"🌊 Tides {label}", f"{short_name(station, 32)} ({miles:.0f}mi), MLLW"]
-        today = datetime.now(tz).date()
-        for when, kind, height in events[:6]:
+        lines = [f"🌊 {label}", f"{short_name(station)} {miles:.0f}mi, ft"]
+        day = datetime.now(tz).date()
+        for when, kind, height in events:
             local = when.astimezone(tz)
-            day = "" if local.date() == today else local.strftime("%a ")
-            lines.append(f"{kind} {day}{clock(when, tz)} {height:.1f}ft")
+            prefix = f"{local:%a} " if local.date() != day else ""
+            day = local.date()
+            line = f"{prefix}{kind} {clock(when, tz)} {height:.1f}"
+            if not fits(lines + [line]):
+                break
+            lines.append(line)
         return "\n".join(lines)
 
     async def water(self, lat: float, lon: float, label: str) -> str:
@@ -222,14 +217,15 @@ class FishingService:
             self._water_temp(lat, lon), self._marine(lat, lon), return_exceptions=True
         )
         tz = await self._timezone(lat, lon)
-        lines = [f"🌡️ Water {label}"]
+        lines = [f"💧 {label}"]
         if not isinstance(water, BaseException) and water:
             value, when, station, miles = water
-            lines.append(f"{value:.1f}°F {short_name(station)} ({miles:.0f}mi) {clock(when, tz)}")
-        if not isinstance(marine, BaseException):
+            lines.append(f"{round(value)}°F {short_name(station)} {miles:.0f}mi {clock(when, tz)}")
+        elif not isinstance(marine, BaseException):
             sst = number(marine.get("sea_surface_temperature"))
             if sst is not None:
-                lines.append(f"Sea surface {round(c_to_f(sst))}°F")
+                lines.append(f"{round(c_to_f(sst))}°F sea surface")
+        if not isinstance(marine, BaseException):
             waves = wave_text(marine, direction=True)
             if waves:
                 lines.append(f"Waves {waves}")
@@ -239,7 +235,7 @@ class FishingService:
 
     async def wind(self, lat: float, lon: float, label: str) -> str:
         forecast = await self._forecast(lat, lon)
-        lines = [f"💨 Wind {label}"]
+        lines = [f"💨 {label}"]
         wind = wind_text(forecast["current"])
         if wind:
             lines.append(f"Now {wind}")
@@ -248,39 +244,40 @@ class FishingService:
             lines.append(pressure)
         now = number(forecast["current"].get("time")) or time.time()
         hourly = forecast.get("hourly") or {}
+        outlook = []
         for step in (2, 4, 6):
             index = closest_index(hourly.get("time"), now + step * 3600)
             if index is None:
                 continue
             values = {key: (hourly.get(key) or [None] * (index + 1))[index]
                       for key in ("wind_speed_10m", "wind_gusts_10m", "wind_direction_10m")}
-            text = wind_text(values)
+            text = wind_text(values, unit="")
             if text:
-                lines.append(f"+{step}h {text}")
+                outlook.append(f"+{step}h {text}")
+        lines.extend(" · ".join(outlook[i:i + 2]) for i in range(0, len(outlook), 2))
         return "\n".join(lines)
 
     async def moon(self, lat: float, lon: float, label: str) -> str:
         forecast = await self._forecast(lat, lon)
         tz = await self._timezone(lat, lon)
         now = datetime.now(timezone.utc)
-        today = now.astimezone(tz).date()
-        lines = [f"🌙 Sun/Moon {label}"]
+        name, emoji, lit = moon_phase(now)
+        lines = [f"🌙 {label}", f"{emoji} {name} {lit}%"]
         sun = sun_times(forecast, tz)
         if sun:
-            lines.append(f"Sun {clock(sun[0], tz)}-{clock(sun[1], tz)}")
-        name, emoji, lit = moon_phase(now)
-        lines.append(f"{emoji} {name} {lit}%")
-        events = moon_events(today, lat, lon, tz)
-        rise_set = [f"{word} {clock(events[key][0], tz)}" for key, word in
-                    (("rise", "Moonrise"), ("set", "set")) if events[key]]
-        if rise_set:
-            lines.append(" · ".join(rise_set))
-        periods = solunar_periods(today, lat, lon, tz, events)
+            lines.append(f"🌅 {clock(sun[0], tz)} 🌇 {clock(sun[1], tz)}")
+        # Minor periods are centred on moonrise and moonset, so those times
+        # are not repeated on a separate line.
+        periods = solunar_periods(now.astimezone(tz).date(), lat, lon, tz)
         for kind in ("Major", "Minor"):
-            times = ", ".join(clock(center, tz) for center, _ in periods[kind.lower()])
+            times = " ".join(clock(center, tz) for center, _ in periods[kind.lower()])
             if times:
                 lines.append(f"{kind} {times}")
         return "\n".join(lines)
+
+
+def fits(lines: Sequence[str], limit: int = MESSAGE_BYTES) -> bool:
+    return len("\n".join(lines).encode("utf-8")) <= limit
 
 
 def zone_or_utc(name: Any) -> ZoneInfo:
@@ -312,12 +309,18 @@ def clock(when: datetime, tz: ZoneInfo) -> str:
     return f"{hour}:{local.minute:02d}{'a' if local.hour < 12 else 'p'}"
 
 
+def shorten(text: str, limit: int) -> str:
+    """Cut text to limit characters, at a word boundary when there is one."""
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit + 1]
+    return cut.rsplit(" ", 1)[0].rstrip() if " " in cut else text[:limit]
+
+
 def short_name(station: dict[str, Any], limit: int = 20) -> str:
-    name = str(station.get("name") or station.get("id") or "station").split(",")[0].strip()
-    if len(name) <= limit:
-        return name
-    cut = name[:limit + 1]
-    return cut.rsplit(" ", 1)[0].rstrip() if " " in cut else name[:limit]
+    name = str(station.get("name") or station.get("id") or "station").split(",")[0]
+    return shorten(name, limit)
 
 
 def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -351,7 +354,7 @@ def closest_index(times: Any, target: float) -> Optional[int]:
     return min(values)[1] if values else None
 
 
-def wind_text(data: dict[str, Any]) -> str:
+def wind_text(data: dict[str, Any], unit: str = "mph") -> str:
     speed = number(data.get("wind_speed_10m"))
     if speed is None:
         return ""
@@ -360,7 +363,7 @@ def wind_text(data: dict[str, Any]) -> str:
     text = f"{compass(direction)} {round(speed)}" if direction is not None else f"{round(speed)}"
     if gusts is not None and round(gusts) > round(speed):
         text += f" G{round(gusts)}"
-    return f"{text}mph"
+    return f"{text}{unit}"
 
 
 def pressure_trend(now_hpa: float, before_hpa: float) -> tuple[str, float]:
@@ -377,7 +380,9 @@ def pressure_text(forecast: dict[str, Any], detail: bool = False) -> str:
     pressure = number(current.get("pressure_msl"))
     if pressure is None:
         return ""
-    text = f'{pressure * HPA_TO_INHG:.2f}"'
+    text = f"{pressure * HPA_TO_INHG:.2f}"
+    if detail:
+        text = f"Pressure {text}inHg"
     hourly = forecast.get("hourly") or {}
     now = number(current.get("time"))
     index = closest_index(hourly.get("time"), now - 3 * 3600) if now is not None else None
@@ -387,8 +392,8 @@ def pressure_text(forecast: dict[str, Any], detail: bool = False) -> str:
         trend, change = pressure_trend(pressure, before)
         text += f" {trend}"
         if detail:
-            text += f" ({change:+.2f}/3h)"
-    return f"Pressure {text}" if detail else text
+            text += f" {change:+.2f}/3h"
+    return text
 
 
 def wave_text(marine: dict[str, Any], direction: bool = False) -> str:
@@ -398,7 +403,7 @@ def wave_text(marine: dict[str, Any], direction: bool = False) -> str:
     text = f"{height:.1f}ft"
     period = number(marine.get("wave_period"))
     if period is not None:
-        text += f" {round(period)}s"
+        text += f" every {round(period)}s"
     heading = number(marine.get("wave_direction"))
     if direction and heading is not None:
         text += f" from {compass(heading)}"
@@ -571,4 +576,4 @@ def solunar_text(periods: dict[str, list[tuple[datetime, timedelta]]], tz: ZoneI
         times = " ".join(clock(center, tz) for center, _ in periods[kind])
         if times:
             parts.append(f"{kind.title()} {times}")
-    return " · ".join(parts)
+    return " ".join(parts)

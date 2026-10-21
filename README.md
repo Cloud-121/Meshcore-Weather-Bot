@@ -35,9 +35,9 @@ four MeshCore application messages; see [API_V2.md](API_V2.md) for the Flutter-f
 grid and bit-packing contract.
 
 The optional `#fishing` channel answers on-demand fishing reports. `fish ZIPCODE` returns
-a short summary: the next two high/low tides, water and air temperature, waves, wind
-and gusts, barometric pressure with its 3-hour trend, sunrise/sunset, moon phase, and
-solunar major/minor times. `fish tide ZIPCODE`, `fish water ZIPCODE`, `fish wind ZIPCODE`
+a two-message summary: the next two high/low tides, water temperature, wave height,
+wind and gusts, barometric pressure with its 3-hour trend, sunrise/sunset, moon phase,
+and solunar major/minor times. Each detail command fits in one message. `fish tide ZIPCODE`, `fish water ZIPCODE`, `fish wind ZIPCODE`
 and `fish moon ZIPCODE` give more detail, and `fish help` lists them. The same commands
 work in a DM. Tide predictions and water temperature come from the nearest NOAA CO-OPS
 station within 50 miles (MLLW datum); wind, pressure and sun times come from Open-Meteo,
@@ -47,10 +47,11 @@ for inland points. Moon phase, moonrise/moonset and solunar periods (lunar trans
 locally and are accurate to a few minutes. `wx`, `ping` and API commands are not
 answered in `#fishing`, and `fish` is not answered in `#Weather`.
 
-`#fishing` requires the `fishing_region` region (default `us-la`) instead of
-`us-la-msy`: a message scoped to `us-la-msy`, or unscoped, is ignored there, and replies
-use the `#us-la` flood scope. Packet verification uses the same transport-code check
-described below, with the key for `#us-la`. All other channels keep `us-la-msy`.
+`#fishing` requires the `fishing_region` region (default `us-gc`) instead of
+`us-la-msy`, and replies use the `#us-gc` flood scope. A bot command there with any other
+region, or none, gets a reply (in the `#us-la-msy` scope) telling the sender to use
+`us-gc`; other chat is ignored. Packet verification uses the same transport-code check
+described below, with the key for `#us-gc`. All other channels keep `us-la-msy`.
 
 Use `wx report ZIPCODE` in a DM to subscribe that identity to NOAA alerts for a ZIP;
 repeat it to add more ZIPs. Every report alert is sent by DM and ends with
@@ -166,7 +167,7 @@ already holds `fishing` it is left unchanged; if it holds a different channel, s
 fails rather than overwrite it, so pick a free index. To use a private key instead, put
 its Base64 value in `fishing_channel_key` and the bot always applies it. Leave
 `fishing_channel_index` unset or `null` to disable the channel. The bot also probes the
-`#us-la` scope at startup.
+`#us-gc` scope at startup.
 
 ## 2. Configure and run
 
