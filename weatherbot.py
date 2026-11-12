@@ -1785,16 +1785,6 @@ def requester_mention(message: InboundMessage) -> str:
     return f"@[{name}]"
 
 
-def message_type_label(message: InboundMessage) -> Optional[str]:
-    """Return the human label for a verified MeshCore RF route type."""
-    return {
-        "FLOOD": "Flood",
-        "DIRECT": "Direct",
-        "TC_FLOOD": "TC Flood",
-        "TC_DIRECT": "TC Direct",
-    }.get(message.message_type or "")
-
-
 def ping_response_data(message: InboundMessage) -> dict[str, Any]:
     received = message.received_at or datetime.now(tz=ZoneInfo("UTC"))
     data: dict[str, Any] = {
@@ -1824,9 +1814,6 @@ def format_ping_response(message: InboundMessage) -> str:
     count = hop_count(message)
     if count is not None:
         response += f"\nHops: {count}"
-    message_type = message_type_label(message)
-    if message_type:
-        response += f"\nMessage Type: {message_type}"
     if "approx_direct_miles" in data:
         response += f"\nApprox. direct distance: {data['approx_direct_miles']:.1f} mi"
     if "analyzer_url" in data:

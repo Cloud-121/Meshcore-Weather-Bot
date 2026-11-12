@@ -73,9 +73,11 @@ Received: <UTC time, HH:MM:SS.mmm>
 Path: <raw route hashes, hop count, or unavailable>
 Region: <resolved MeshCore region, when supplied>
 Hops: <hop count, when known>
-Message Type: <Flood, Direct, TC Flood, or TC Direct when RF-log verified>
 Approx. direct distance: <miles> mi
+https://analyzer.gulfcoastmesh.org/#/packet/<packet id>/route
 ```
+
+The analyzer link is present only for channel pings matched to a raw RF frame.
 
 The distance line is present only when the bot and a DM sender have advertised GPS
 coordinates. It is straight-line endpoint distance, not the distance through relays.

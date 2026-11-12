@@ -1310,8 +1310,7 @@ class CommandFeatureTests(unittest.IsolatedAsyncioTestCase):
             "Received: 12:00:05.525 UTC\n"
             "Path: 3 hops\n"
             "Region: us-gulf\n"
-            "Hops: 3\n"
-            "Message Type: TC Flood",
+            "Hops: 3",
         )
         self.assertEqual(
             weatherbot.requester_mention(
