@@ -56,6 +56,7 @@ REGION_REQUIRED_TEXT = (
     "Set your region to {region} and try again."
 )
 RAW_PATH_CACHE_SECONDS = 10.0
+ANALYZER_PACKET_URL = "https://analyzer.gulfcoastmesh.org/#/packet/{}/route"
 RAW_PATH_CACHE_LIMIT = 128
 HELP_TEXT = (
     "Gulf Coast Mesh Bot, Designed by ScarlettOSA\n"
@@ -97,6 +98,7 @@ class InboundMessage:
     region: Optional[str] = None
     required_region_match: Optional[bool] = None
     message_type: Optional[str] = None
+    packet_hash: Optional[str] = None
 
     @property
     def is_channel(self) -> bool:
@@ -113,6 +115,7 @@ class RawChannelMetadata:
     path_hash_mode: int
     message_type: Optional[str]
     required_region_match: Optional[bool]
+    packet_hash: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -713,6 +716,7 @@ class WeatherBot:
             required_region_match=raw_region_match(
                 payload, self._channel_region(index) or REGION
             ),
+            packet_hash=meshcore_packet_hash(payload.get("payload")),
         )
 
     def _remember_raw_channel_path(
@@ -725,6 +729,7 @@ class WeatherBot:
         *,
         channel_index: int,
         required_region_match: Optional[bool] = None,
+        packet_hash: Optional[str] = None,
     ) -> None:
         now = time.monotonic()
         self._raw_channel_paths = deque(
@@ -734,7 +739,7 @@ class WeatherBot:
         )
         self._raw_channel_paths.append(RawChannelMetadata(
             now, channel_index, sender_timestamp, text, path,
-            path_hash_mode, message_type, required_region_match,
+            path_hash_mode, message_type, required_region_match, packet_hash,
         ))
 
     def _attach_raw_channel_path(self, message: InboundMessage) -> InboundMessage:
@@ -766,6 +771,7 @@ class WeatherBot:
             message, path=match.path, path_hash_mode=match.path_hash_mode,
             message_type=match.message_type or message.message_type,
             required_region_match=status, region=region,
+            packet_hash=match.packet_hash or message.packet_hash,
         )
 
     def _direct_distance_miles(self, message: InboundMessage) -> Optional[float]:
@@ -1618,6 +1624,33 @@ def integer_or_none(value: Any) -> Optional[int]:
         return None
 
 
+def meshcore_packet_hash(raw: Any) -> Optional[str]:
+    """Return the packet ID used by analyzer.gulfcoastmesh.org (CoreScope).
+
+    SHA-256 over the header byte followed by the payload (transport codes and
+    path excluded), truncated to 8 bytes and written as lowercase hex.
+    """
+    try:
+        frame = bytes.fromhex(raw) if isinstance(raw, str) else raw
+        if not isinstance(frame, (bytes, bytearray)) or len(frame) < 2:
+            return None
+        path_offset = 5 if (frame[0] & 3) in (0, 3) else 1
+        if len(frame) <= path_offset:
+            return None
+        path_byte = frame[path_offset]
+        hash_size = (path_byte >> 6) + 1
+        path_bytes = (path_byte & 63) * hash_size
+        if hash_size == 4 or path_bytes > 64:
+            return None
+        payload_start = path_offset + 1 + path_bytes
+        if len(frame) < payload_start:
+            return None
+        data = bytes(frame[:1]) + bytes(frame[payload_start:])
+        return hashlib.sha256(data).digest()[:8].hex()
+    except (ValueError, TypeError):
+        return None
+
+
 def raw_region_match(payload: Any, region: str = REGION) -> Optional[bool]:
     """Verify the first transport code as RegionMap::findMatch does in MeshCore.
 
@@ -1771,6 +1804,9 @@ def ping_response_data(message: InboundMessage) -> dict[str, Any]:
     }
     if message.approx_direct_miles is not None:
         data["approx_direct_miles"] = round(message.approx_direct_miles, 1)
+    if message.packet_hash:
+        data["packet_hash"] = message.packet_hash
+        data["analyzer_url"] = ANALYZER_PACKET_URL.format(message.packet_hash)
     return data
 
 
@@ -1793,6 +1829,8 @@ def format_ping_response(message: InboundMessage) -> str:
         response += f"\nMessage Type: {message_type}"
     if "approx_direct_miles" in data:
         response += f"\nApprox. direct distance: {data['approx_direct_miles']:.1f} mi"
+    if "analyzer_url" in data:
+        response += f"\n{data['analyzer_url']}"
     return response
 
 

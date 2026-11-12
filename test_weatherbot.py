@@ -945,6 +945,56 @@ class MeshAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(calls, 1)
 
+    def test_packet_hash_matches_analyzer(self):
+        # Real frame from analyzer.gulfcoastmesh.org/#/packet/b33b67bd6d8b2b3d
+        frame = (
+            "1540119259A3275253F50CA54E95661F83EA942B28CFAFB85F5AF39FAB3614323F"
+            "4531FD75270670C0FE6B7EC1A69F641D96818959"
+        )
+        self.assertEqual(weatherbot.meshcore_packet_hash(frame), "b33b67bd6d8b2b3d")
+        self.assertEqual(
+            weatherbot.meshcore_packet_hash(bytes.fromhex(frame)), "b33b67bd6d8b2b3d"
+        )
+        # Path hops and transport codes don't change the ID.
+        with_path = "1542" + "dadadca2" + frame[4:]
+        self.assertEqual(weatherbot.meshcore_packet_hash(with_path), "b33b67bd6d8b2b3d")
+        transport = "14" + "aabbccdd" + frame[2:]
+        self.assertEqual(
+            weatherbot.meshcore_packet_hash(transport),
+            weatherbot.hashlib.sha256(bytes.fromhex("14" + frame[4:])).hexdigest()[:16],
+        )
+        self.assertIsNone(weatherbot.meshcore_packet_hash("15"))
+        self.assertIsNone(weatherbot.meshcore_packet_hash("not hex"))
+        self.assertIsNone(weatherbot.meshcore_packet_hash(None))
+        self.assertIsNone(weatherbot.meshcore_packet_hash("15ff"))
+
+    async def test_raw_channel_event_packet_hash_reaches_ping(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = make_config(Path(directory) / "state.json")
+            bot = weatherbot.WeatherBot(config, weather=FakeBriefWeather())
+            bot._remember_raw_channel_event({
+                "chan_name": config.test_channel_name,
+                "sender_timestamp": 100,
+                "message": "Alice: ping",
+                "path_hash_size": 2,
+                "path": "",
+                "route_typename": "FLOOD",
+                "payload": "1540119259A3275253F50CA54E95661F83EA942B28CFAFB85F5AF39FAB"
+                           "3614323F4531FD75270670C0FE6B7EC1A69F641D96818959",
+            })
+            matched = bot._attach_raw_channel_path(
+                weatherbot.InboundMessage(
+                    "Alice: ping", channel_index=config.test_channel_index,
+                    sender_timestamp=100,
+                )
+            )
+        self.assertEqual(matched.packet_hash, "b33b67bd6d8b2b3d")
+        self.assertTrue(
+            weatherbot.format_ping_response(matched).endswith(
+                "\nhttps://analyzer.gulfcoastmesh.org/#/packet/b33b67bd6d8b2b3d/route"
+            )
+        )
+
     async def test_raw_test_channel_path_is_attached_only_on_exact_match(self):
         with tempfile.TemporaryDirectory() as directory:
             bot = weatherbot.WeatherBot(
@@ -970,6 +1020,7 @@ class MeshAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(matched.path, "af2b8a10")
         self.assertEqual(matched.path_hash_mode, 1)
+        self.assertIsNone(matched.packet_hash)
         self.assertEqual(matched.message_type, "FLOOD")
         self.assertIsNone(unmatched.path)
         self.assertEqual(weatherbot.route_description(unmatched), "2 hops")
@@ -1278,6 +1329,13 @@ class CommandFeatureTests(unittest.IsolatedAsyncioTestCase):
             "Approx. direct distance: 12.3 mi",
         )
         self.assertEqual(weatherbot.ping_response_data(distance_message)["approx_direct_miles"], 12.3)
+        linked_message = weatherbot.InboundMessage(
+            "ping", approx_direct_miles=12.34, packet_hash="b33b67bd6d8b2b3d"
+        )
+        url = "https://analyzer.gulfcoastmesh.org/#/packet/b33b67bd6d8b2b3d/route"
+        self.assertEqual(weatherbot.format_ping_response(linked_message).splitlines()[-1], url)
+        self.assertEqual(weatherbot.ping_response_data(linked_message)["analyzer_url"], url)
+        self.assertNotIn("analyzer_url", weatherbot.ping_response_data(distance_message))
         encoded = {"type": "test", "message": "☀" * 100}
         chunks = weatherbot.split_mesh_json(encoded)
         self.assertTrue(all(len(chunk.encode("utf-8")) <= 140 for chunk in chunks))
