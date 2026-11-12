@@ -968,6 +968,90 @@ class MeshAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(weatherbot.meshcore_packet_hash(None))
         self.assertIsNone(weatherbot.meshcore_packet_hash("15ff"))
 
+    async def test_route_distance_from_contacts_and_analyzer(self):
+        class FakeAnalyzer:
+            def __init__(self):
+                self.packet_calls = 0
+
+            async def path_keys(self, packet_hash):
+                self.packet_calls += 1
+                return {"cc": "cc" + "0" * 62} if self.packet_calls > 1 else None
+
+            async def node_coordinates(self, public_key):
+                return {"cc" + "0" * 62: (30.2, -90.0)}.get(public_key)
+
+            async def coordinates_by_name(self, name):
+                return (29.9, -90.0) if name == "Remote" else None
+
+            async def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            analyzer = FakeAnalyzer()
+            bot = weatherbot.WeatherBot(
+                make_config(Path(directory) / "state.json"),
+                weather=FakeBriefWeather(), analyzer=analyzer,
+            )
+            bot._bot_coordinates = (30.3, -90.0)
+            bot._contacts = {
+                "aa1111111111": {"public_key": "aa11" + "1" * 60, "adv_lat": 30.0, "adv_lon": -90.0},
+                "bb2222222222": {"public_key": "bb22" + "2" * 60, "adv_lat": 30.1, "adv_lon": -90.0},
+                "dd3333333333": {"public_key": "dd33" + "3" * 60, "adv_name": "Alice",
+                                 "adv_lat": 29.9, "adv_lon": -90.0},
+                "ee4444444444": {"public_key": "ee44" + "4" * 60, "adv_lat": 30.0, "adv_lon": -90.0},
+                "ee5555555555": {"public_key": "ee55" + "5" * 60, "adv_lat": 31.0, "adv_lon": -90.0},
+            }
+            leg = weatherbot.haversine_miles((30.0, -90.0), (30.1, -90.0))
+
+            # All local: Alice (29.9) -> AA (30.0) -> BB (30.1) -> bot (30.3).
+            local = await bot._with_route_distance(weatherbot.InboundMessage(
+                "Alice: ping", channel_index=2, path="aabb", path_hash_mode=0,
+            ))
+            self.assertAlmostEqual(local.route_miles, leg * 4, places=1)
+            self.assertFalse(local.route_from_first_hop)
+            self.assertTrue(weatherbot.format_ping_response(local).endswith(
+                f"\nRoute distance: {local.route_miles:.1f} mi"))
+
+            # Unknown sender, no packet hash: measured from the first repeater.
+            first_hop = await bot._with_route_distance(weatherbot.InboundMessage(
+                "Bob: ping", channel_index=2, path="aabb", path_hash_mode=0,
+            ))
+            self.assertAlmostEqual(first_hop.route_miles, leg * 3, places=1)
+            self.assertIn("(from 1st hop)", weatherbot.format_ping_response(first_hop, link=True))
+
+            # Ambiguous local ID (EE matches two contacts) and no analyzer: no line.
+            ambiguous = await bot._with_route_distance(weatherbot.InboundMessage(
+                "Alice: ping", channel_index=2, path="ee", path_hash_mode=0,
+            ))
+            self.assertIsNone(ambiguous.route_miles)
+            self.assertNotIn("Route distance", weatherbot.format_ping_response(ambiguous))
+
+            # Analyzer fills hop CC (after one retry) and the sender's location.
+            with patch.object(weatherbot, "ANALYZER_RETRY_DELAY_SECONDS", 0):
+                filled = await bot._with_route_distance(weatherbot.InboundMessage(
+                    "Remote: ping", channel_index=2, path="aacc", path_hash_mode=0,
+                    packet_hash="b33b67bd6d8b2b3d",
+                ))
+            self.assertEqual(analyzer.packet_calls, 2)
+            self.assertAlmostEqual(filled.route_miles, leg * 4, places=1)
+            self.assertFalse(filled.route_from_first_hop)
+
+    def test_path_hashes_and_sender_name(self):
+        self.assertEqual(
+            weatherbot.path_hashes(weatherbot.InboundMessage("ping", path="AF2B8A10", path_hash_mode=1)),
+            ["af2b", "8a10"],
+        )
+        self.assertIsNone(weatherbot.path_hashes(weatherbot.InboundMessage("ping", path="abc")))
+        self.assertIsNone(weatherbot.path_hashes(weatherbot.InboundMessage("ping")))
+        self.assertEqual(
+            weatherbot.message_sender_name(weatherbot.InboundMessage("Alice: ping", channel_index=2)),
+            "Alice",
+        )
+        self.assertEqual(
+            weatherbot.message_sender_name(weatherbot.InboundMessage("ping", sender_name="Bob")),
+            "Bob",
+        )
+
     async def test_raw_channel_event_packet_hash_reaches_ping(self):
         with tempfile.TemporaryDirectory() as directory:
             config = make_config(Path(directory) / "state.json")
@@ -990,7 +1074,7 @@ class MeshAdapterTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(matched.packet_hash, "b33b67bd6d8b2b3d")
         self.assertTrue(
-            weatherbot.format_ping_response(matched).endswith(
+            weatherbot.format_ping_response(matched, link=True).endswith(
                 "\nhttps://analyzer.gulfcoastmesh.org/#/packet/b33b67bd6d8b2b3d/route"
             )
         )
@@ -1284,6 +1368,7 @@ class CommandFeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             weatherbot.format_ping_response(message),
             "@[Alice] 🏓 Pong\n"
+            "Received: 12:00:00.000 UTC\n"
             "Path: AA-BB-CC-DD\n"
             "Hops: 4",
         )
@@ -1306,9 +1391,11 @@ class CommandFeatureTests(unittest.IsolatedAsyncioTestCase):
                 )
             ),
             "@[Alice] 🏓 Pong\n"
+            "Received: 12:00:05.525 UTC\n"
             "Path: 3 hops\n"
             "Region: us-gulf\n"
-            "Hops: 3",
+            "Hops: 3\n"
+            "Message Type: TC Flood",
         )
         self.assertEqual(
             weatherbot.requester_mention(
@@ -1330,16 +1417,35 @@ class CommandFeatureTests(unittest.IsolatedAsyncioTestCase):
             "ping", approx_direct_miles=12.34, packet_hash="b33b67bd6d8b2b3d"
         )
         url = "https://analyzer.gulfcoastmesh.org/#/packet/b33b67bd6d8b2b3d/route"
-        self.assertEqual(weatherbot.format_ping_response(linked_message).splitlines()[-1], url)
+        self.assertEqual(
+            weatherbot.format_ping_response(linked_message, link=True).splitlines()[-1], url
+        )
+        self.assertNotIn(url, weatherbot.format_ping_response(linked_message))
+        self.assertEqual(
+            weatherbot.format_ping_response(distance_message, link=True).splitlines()[-1],
+            "Link: unavailable (DMs and unmatched packets)",
+        )
+        compact = weatherbot.format_ping_response(
+            weatherbot.InboundMessage(
+                "Alice: ping", channel_index=2, path="aabb", path_hash_mode=0,
+                message_type="FLOOD", packet_hash="b33b67bd6d8b2b3d",
+            ),
+            link=True,
+        )
+        self.assertEqual(
+            compact,
+            "@[Alice] 🏓 Pong\nPath: AA-BB\nHops: 2\n" + url,
+        )
         one_message = weatherbot.InboundMessage(
             "Alice: ping", channel_index=2, path="ab" * 10, path_hash_mode=1,
             region="us-gulf", packet_hash="b33b67bd6d8b2b3d",
         )
-        reply = weatherbot.format_ping_response(one_message)
+        reply = weatherbot.format_ping_response(one_message, link=True)
         self.assertGreater(len(reply.encode("utf-8")), 130)
         self.assertEqual(weatherbot.split_mesh_text(reply), [reply])
-        self.assertEqual(weatherbot.ping_response_data(linked_message)["analyzer_url"], url)
-        self.assertNotIn("analyzer_url", weatherbot.ping_response_data(distance_message))
+        self.assertEqual(
+            weatherbot.PING_COMMAND.fullmatch("PING Link").group(1).lower(), "link"
+        )
         encoded = {"type": "test", "message": "☀" * 100}
         chunks = weatherbot.split_mesh_json(encoded)
         self.assertTrue(all(len(chunk.encode("utf-8")) <= 140 for chunk in chunks))

@@ -69,14 +69,38 @@ Please run wx report ZIPCODE or wx report stop in a DM.
 
 ```text
 @[<user>] 🏓 Pong
+Received: <UTC time, HH:MM:SS.mmm>
+Path: <raw route hashes, hop count, or unavailable>
+Region: <resolved MeshCore region, when supplied>
+Hops: <hop count, when known>
+Message Type: <Flood, Direct, TC Flood, or TC Direct when RF-log verified>
+Approx. direct distance: <miles> mi
+Route distance: <miles> mi[ (from 1st hop)]
+```
+
+## `ping link`
+
+Same as `ping`, without the Received and Message Type lines, plus an analyzer link so
+the reply usually fits in one message:
+
+```text
+@[<user>] 🏓 Pong
 Path: <raw route hashes, hop count, or unavailable>
 Region: <resolved MeshCore region, when supplied>
 Hops: <hop count, when known>
 Approx. direct distance: <miles> mi
+Route distance: <miles> mi[ (from 1st hop)]
 https://analyzer.gulfcoastmesh.org/#/packet/<packet id>/route
 ```
 
-The analyzer link is present only for channel pings matched to a raw RF frame.
+The link needs a channel ping matched to a raw RF frame; otherwise the last line is
+`Link: unavailable (DMs and unmatched packets)`.
+
+The route distance line adds up each leg from the sender through every repeater in the
+path to the bot. Repeater and sender locations come from the companion's contacts first,
+then from analyzer.gulfcoastmesh.org (channel pings only). If the sender's location is
+unknown the distance starts at the first repeater, marked `(from 1st hop)`. The line is
+left out if any repeater can't be located or an ID matches more than one node.
 
 The distance line is present only when the bot and a DM sender have advertised GPS
 coordinates. It is straight-line endpoint distance, not the distance through relays.

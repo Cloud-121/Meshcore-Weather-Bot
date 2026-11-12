@@ -44,7 +44,7 @@ WX_VERSION_COMMAND = re.compile(r"\s*wx\s+version(?:\s+(json))?\s*", re.IGNORECA
 WX_REPORT_COMMAND = re.compile(
     r"\s*wx\s+report\s+(stop|(\d{5})(?:-\d{4})?)(?:\s+(json))?\s*", re.IGNORECASE
 )
-PING_COMMAND = re.compile(r"\s*ping(?:\s+(json))?\s*", re.IGNORECASE)
+PING_COMMAND = re.compile(r"\s*ping(?:\s+(json|link))?\s*", re.IGNORECASE)
 FISH_COMMAND = re.compile(
     r"\s*fish\s+(?:(tides?|water|wind|moon)\s+)?(\d{5})(?:-\d{4})?\s*", re.IGNORECASE
 )
@@ -56,7 +56,10 @@ REGION_REQUIRED_TEXT = (
     "Set your region to {region} and try again."
 )
 RAW_PATH_CACHE_SECONDS = 10.0
-ANALYZER_PACKET_URL = "https://analyzer.gulfcoastmesh.org/#/packet/{}/route"
+ANALYZER_BASE_URL = "https://analyzer.gulfcoastmesh.org"
+ANALYZER_PACKET_URL = ANALYZER_BASE_URL + "/#/packet/{}/route"
+ANALYZER_TIMEOUT_SECONDS = 6.0
+ANALYZER_RETRY_DELAY_SECONDS = 1.5
 RAW_PATH_CACHE_LIMIT = 128
 HELP_TEXT = (
     "Gulf Coast Mesh Bot, Designed by ScarlettOSA\n"
@@ -65,7 +68,8 @@ HELP_TEXT = (
     "wx report stop: stop DM alerts\n"
     "wx version: running Git commit\n"
     "fish ZIPCODE: #fishing report\n"
-    "ping: DM or #test"
+    "ping: DM or #test\n"
+    "ping link: ping with analyzer link"
 )
 REPORT_STOP_TEXT = "To stop these alerts: wx report stop"
 UNKNOWN_SENDER_NOTICE = (
@@ -99,6 +103,8 @@ class InboundMessage:
     required_region_match: Optional[bool] = None
     message_type: Optional[str] = None
     packet_hash: Optional[str] = None
+    route_miles: Optional[float] = None
+    route_from_first_hop: bool = False
 
     @property
     def is_channel(self) -> bool:
@@ -157,6 +163,71 @@ class BotConfig:
     fishing_channel_name: str = "fishing"
     fishing_channel_key: str = ""
     fishing_region: str = "us-gc"
+
+
+class AnalyzerClient:
+    """Read-only lookups against the Gulf Coast Mesh analyzer (CoreScope) API."""
+
+    def __init__(self, user_agent: str, timeout: float = 4.0,
+                 base_url: str = ANALYZER_BASE_URL) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.client = httpx.AsyncClient(
+            timeout=timeout,
+            headers={"User-Agent": user_agent, "Accept": "application/json"},
+        )
+
+    async def close(self) -> None:
+        await self.client.aclose()
+
+    async def _get(self, path: str, params: Optional[dict[str, str]] = None) -> Any:
+        try:
+            response = await self.client.get(f"{self.base_url}{path}", params=params)
+            if response.status_code != 200:
+                return None
+            return response.json()
+        except (httpx.HTTPError, ValueError):
+            return None
+
+    async def path_keys(self, packet_hash: str) -> Optional[dict[str, str]]:
+        """Map path IDs to full public keys from the analyzer's resolved routes.
+
+        Returns None when the packet isn't on the analyzer (yet). IDs that resolve
+        to different keys in different observations are left out.
+        """
+        data = await self._get(f"/api/packets/{packet_hash}")
+        packet = data.get("packet") if isinstance(data, dict) else None
+        if not isinstance(packet, dict):
+            return None
+        seen: dict[str, set[str]] = {}
+        for item in [packet, *(packet.get("observations") or [])]:
+            if not isinstance(item, dict):
+                continue
+            try:
+                hops = json.loads(item.get("path_json") or "[]")
+            except (TypeError, ValueError):
+                continue
+            keys = item.get("resolved_path") or []
+            if not isinstance(hops, list) or not isinstance(keys, list):
+                continue
+            for hop, key in zip(hops, keys):
+                if isinstance(hop, str) and isinstance(key, str) and key:
+                    seen.setdefault(hop.lower(), set()).add(key.lower())
+        return {hop: next(iter(keys)) for hop, keys in seen.items() if len(keys) == 1}
+
+    async def node_coordinates(self, public_key: str) -> Optional[tuple[float, float]]:
+        data = await self._get(f"/api/nodes/{public_key}")
+        node = data.get("node") if isinstance(data, dict) else None
+        return analyzer_coordinates(node)
+
+    async def coordinates_by_name(self, name: str) -> Optional[tuple[float, float]]:
+        """Return coordinates for the one analyzer node with exactly this name."""
+        data = await self._get("/api/nodes/search", {"q": name})
+        nodes = data.get("nodes") if isinstance(data, dict) else None
+        matches = [node for node in nodes or []
+                   if isinstance(node, dict) and node.get("name") == name]
+        if len(matches) != 1:
+            return None
+        return analyzer_coordinates(matches[0])
 
 
 class WeatherService:
@@ -341,8 +412,11 @@ class WeatherService:
 class WeatherBot:
     def __init__(self, config: BotConfig, weather: Optional[WeatherService] = None,
                  radar: Optional[RadarService] = None,
-                 fishing: Optional[FishingService] = None) -> None:
+                 fishing: Optional[FishingService] = None,
+                 analyzer: Optional[AnalyzerClient] = None) -> None:
         self.config = config
+        self._owns_analyzer = analyzer is None
+        self.analyzer = analyzer or AnalyzerClient(config.noaa_user_agent)
         self._owns_weather = weather is None
         self.weather = weather or WeatherService(
             config.noaa_user_agent, timeout=config.http_timeout_seconds
@@ -408,6 +482,8 @@ class WeatherBot:
                 await self.radar.close()
             if self._owns_fishing:
                 await self.fishing.close()
+            if self._owns_analyzer:
+                await self.analyzer.close()
 
     async def _serve_connection(self, mesh: Any) -> None:
         self._raw_channel_paths.clear()
@@ -957,11 +1033,13 @@ class WeatherBot:
                 )
                 if message.channel_index != expected_channel:
                     return False
-            if ping_match.group(1):
+            modifier = (ping_match.group(1) or "").lower()
+            if modifier == "json":
                 response: str | dict[str, Any] = ping_response_data(message)
             else:
                 message = await self._with_ping_sender_name(mesh, message)
-                response = format_ping_response(message)
+                message = await self._with_route_distance(message)
+                response = format_ping_response(message, link=modifier == "link")
             await self._reply(mesh, message, response)
             return True
 
@@ -1208,6 +1286,82 @@ class WeatherBot:
             return message
         name = str(contact.get("adv_name") or "").strip()
         return replace(message, sender_name=name or None)
+
+    async def _with_route_distance(self, message: InboundMessage) -> InboundMessage:
+        """Attach the summed distance along the received path, when every hop is known.
+
+        Repeater locations come from companion contacts first, then the analyzer.
+        Without the sender's location the distance starts at the first repeater.
+        """
+        try:
+            hops = path_hashes(message)
+            if not hops or self._bot_coordinates is None:
+                return message
+            points = [self._contact_coordinates_by_prefix(hop) for hop in hops]
+            sender = self._local_sender_coordinates(message)
+            if (None in points or sender is None) and message.packet_hash:
+                try:
+                    points, sender = await asyncio.wait_for(
+                        self._fill_from_analyzer(message, hops, points, sender),
+                        ANALYZER_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    LOG.info("Analyzer lookup timed out for packet %s", message.packet_hash)
+            if None in points:
+                return message
+            route = [sender] if sender else []
+            route += [point for point in points if point is not None]
+            route.append(self._bot_coordinates)
+            miles = sum(haversine_miles(a, b) for a, b in zip(route, route[1:]))
+            return replace(message, route_miles=miles, route_from_first_hop=sender is None)
+        except Exception:
+            LOG.exception("Could not compute route distance")
+            return message
+
+    async def _fill_from_analyzer(
+        self,
+        message: InboundMessage,
+        hops: list[str],
+        points: list[Optional[tuple[float, float]]],
+        sender: Optional[tuple[float, float]],
+    ) -> tuple[list[Optional[tuple[float, float]]], Optional[tuple[float, float]]]:
+        points = list(points)
+        if None in points and message.packet_hash:
+            keys = await self.analyzer.path_keys(message.packet_hash)
+            if keys is None:  # The analyzer may not have ingested it yet.
+                await asyncio.sleep(ANALYZER_RETRY_DELAY_SECONDS)
+                keys = await self.analyzer.path_keys(message.packet_hash)
+            missing = [i for i, point in enumerate(points)
+                       if point is None and (keys or {}).get(hops[i])]
+            found = await asyncio.gather(
+                *(self.analyzer.node_coordinates(keys[hops[i]]) for i in missing)
+            ) if missing else []
+            for index, coordinates in zip(missing, found):
+                points[index] = coordinates
+        if sender is None:
+            name = message_sender_name(message)
+            if name:
+                sender = await self.analyzer.coordinates_by_name(name)
+        return points, sender
+
+    def _contact_coordinates_by_prefix(self, prefix: str) -> Optional[tuple[float, float]]:
+        """Coordinates of the one contact whose key starts with a path ID."""
+        matches = {
+            str(contact.get("public_key")).lower(): contact
+            for key, contact in self._contacts.items() if key.startswith(prefix)
+        }
+        if len(matches) != 1:
+            return None
+        return coordinates_or_none(next(iter(matches.values())))
+
+    def _local_sender_coordinates(self, message: InboundMessage) -> Optional[tuple[float, float]]:
+        if not message.is_channel and message.sender_prefix:
+            contact = self._contacts.get(message.sender_prefix[:12].lower())
+            return coordinates_or_none(contact or {})
+        name = message_sender_name(message)
+        matches = [contact for contact in self._contacts.values()
+                   if name and str(contact.get("adv_name") or "").strip() == name]
+        return coordinates_or_none(matches[0]) if len(matches) == 1 else None
 
     async def _reply_v2(self, mesh: Any, message: InboundMessage, data: dict[str, Any]) -> None:
         flood_warning = False
@@ -1731,6 +1885,29 @@ def coordinates_or_none(data: dict[str, Any]) -> Optional[tuple[float, float]]:
     return latitude, longitude
 
 
+def analyzer_coordinates(node: Any) -> Optional[tuple[float, float]]:
+    if not isinstance(node, dict):
+        return None
+    return coordinates_or_none({"adv_lat": node.get("lat"), "adv_lon": node.get("lon")})
+
+
+def path_hashes(message: InboundMessage) -> Optional[list[str]]:
+    """Split the received path into lowercase per-hop IDs, first repeater first."""
+    if not message.path:
+        return None
+    width = ((message.path_hash_mode or 0) + 1) * 2
+    if width <= 0 or len(message.path) % width:
+        return None
+    return [message.path[i : i + width].lower() for i in range(0, len(message.path), width)]
+
+
+def message_sender_name(message: InboundMessage) -> Optional[str]:
+    """The sender's advertised name: from a DM contact or the channel text prefix."""
+    if message.is_channel and ": " in message.text:
+        return message.text.split(": ", 1)[0].strip() or None
+    return message.sender_name
+
+
 def haversine_miles(
     first: tuple[float, float], second: tuple[float, float]
 ) -> float:
@@ -1794,24 +1971,47 @@ def ping_response_data(message: InboundMessage) -> dict[str, Any]:
     }
     if message.approx_direct_miles is not None:
         data["approx_direct_miles"] = round(message.approx_direct_miles, 1)
-    if message.packet_hash:
-        data["packet_hash"] = message.packet_hash
-        data["analyzer_url"] = ANALYZER_PACKET_URL.format(message.packet_hash)
     return data
 
 
-def format_ping_response(message: InboundMessage) -> str:
+def message_type_label(message: InboundMessage) -> Optional[str]:
+    """Return the human label for a verified MeshCore RF route type."""
+    return {
+        "FLOOD": "Flood",
+        "DIRECT": "Direct",
+        "TC_FLOOD": "TC Flood",
+        "TC_DIRECT": "TC Direct",
+    }.get(message.message_type or "")
+
+
+def format_ping_response(message: InboundMessage, link: bool = False) -> str:
+    """Format a pong; `link` drops time/type to fit the analyzer URL in one message."""
     data = ping_response_data(message)
-    response = f"{requester_mention(message)} 🏓 Pong\nPath: {data['path']}"
+    response = f"{requester_mention(message)} 🏓 Pong\n"
+    if not link:
+        received = message.received_at or datetime.now(tz=ZoneInfo("UTC"))
+        received_time = received.astimezone(ZoneInfo("UTC")).strftime("%H:%M:%S.%f")[:12]
+        response += f"Received: {received_time} UTC\n"
+    response += f"Path: {data['path']}"
     if message.region:
         response += f"\nRegion: {message.region}"
     count = hop_count(message)
     if count is not None:
         response += f"\nHops: {count}"
+    message_type = message_type_label(message)
+    if message_type and not link:
+        response += f"\nMessage Type: {message_type}"
     if "approx_direct_miles" in data:
         response += f"\nApprox. direct distance: {data['approx_direct_miles']:.1f} mi"
-    if "analyzer_url" in data:
-        response += f"\n{data['analyzer_url']}"
+    if message.route_miles is not None:
+        response += f"\nRoute distance: {message.route_miles:.1f} mi"
+        if message.route_from_first_hop:
+            response += " (from 1st hop)"
+    if link:
+        if message.packet_hash:
+            response += f"\n{ANALYZER_PACKET_URL.format(message.packet_hash)}"
+        else:
+            response += "\nLink: unavailable (DMs and unmatched packets)"
     return response
 
 
@@ -1826,6 +2026,7 @@ def help_response_data() -> dict[str, Any]:
             "wx report stop",
             "wx version",
             "ping",
+            "ping link",
         ],
         "json_modifier": "Append json to a command for a structured response.",
     }
