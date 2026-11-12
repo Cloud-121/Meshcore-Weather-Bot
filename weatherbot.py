@@ -1802,13 +1802,7 @@ def ping_response_data(message: InboundMessage) -> dict[str, Any]:
 
 def format_ping_response(message: InboundMessage) -> str:
     data = ping_response_data(message)
-    received = message.received_at or datetime.now(tz=ZoneInfo("UTC"))
-    received_time = received.astimezone(ZoneInfo("UTC")).strftime("%H:%M:%S.%f")[:12]
-    response = (
-        f"{requester_mention(message)} 🏓 Pong\n"
-        f"Received: {received_time} UTC\n"
-        f"Path: {data['path']}"
-    )
+    response = f"{requester_mention(message)} 🏓 Pong\nPath: {data['path']}"
     if message.region:
         response += f"\nRegion: {message.region}"
     count = hop_count(message)
@@ -2265,8 +2259,11 @@ def _cut_utf8(text: str, byte_limit: int) -> tuple[str, str]:
 
 def split_mesh_text(text: str, byte_limit: int = 140) -> list[str]:
     """Split text on line/word boundaries, leaving room for part numbers."""
+    cleaned = clean_lines(text)
+    if cleaned and len(cleaned.encode("utf-8")) <= byte_limit:
+        return [cleaned]  # Single message: no part marker needed.
     body_limit = byte_limit - 10
-    lines = clean_lines(text).split("\n")
+    lines = cleaned.split("\n")
     chunks: list[str] = []
     current = ""
     for line in lines:

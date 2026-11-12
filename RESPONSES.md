@@ -69,7 +69,6 @@ Please run wx report ZIPCODE or wx report stop in a DM.
 
 ```text
 @[<user>] 🏓 Pong
-Received: <UTC time, HH:MM:SS.mmm>
 Path: <raw route hashes, hop count, or unavailable>
 Region: <resolved MeshCore region, when supplied>
 Hops: <hop count, when known>

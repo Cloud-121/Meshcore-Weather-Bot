@@ -1284,7 +1284,6 @@ class CommandFeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             weatherbot.format_ping_response(message),
             "@[Alice] 🏓 Pong\n"
-            "Received: 12:00:00.000 UTC\n"
             "Path: AA-BB-CC-DD\n"
             "Hops: 4",
         )
@@ -1307,7 +1306,6 @@ class CommandFeatureTests(unittest.IsolatedAsyncioTestCase):
                 )
             ),
             "@[Alice] 🏓 Pong\n"
-            "Received: 12:00:05.525 UTC\n"
             "Path: 3 hops\n"
             "Region: us-gulf\n"
             "Hops: 3",
@@ -1333,6 +1331,13 @@ class CommandFeatureTests(unittest.IsolatedAsyncioTestCase):
         )
         url = "https://analyzer.gulfcoastmesh.org/#/packet/b33b67bd6d8b2b3d/route"
         self.assertEqual(weatherbot.format_ping_response(linked_message).splitlines()[-1], url)
+        one_message = weatherbot.InboundMessage(
+            "Alice: ping", channel_index=2, path="ab" * 10, path_hash_mode=1,
+            region="us-gulf", packet_hash="b33b67bd6d8b2b3d",
+        )
+        reply = weatherbot.format_ping_response(one_message)
+        self.assertGreater(len(reply.encode("utf-8")), 130)
+        self.assertEqual(weatherbot.split_mesh_text(reply), [reply])
         self.assertEqual(weatherbot.ping_response_data(linked_message)["analyzer_url"], url)
         self.assertNotIn("analyzer_url", weatherbot.ping_response_data(distance_message))
         encoded = {"type": "test", "message": "☀" * 100}
