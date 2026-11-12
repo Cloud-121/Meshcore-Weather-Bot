@@ -2,6 +2,8 @@
   "repeater_host": "127.0.0.1",
   "repeater_port": 5001,
   "bot_name": "WeatherBot",
+  "bot_latitude": null,
+  "bot_longitude": null,
 
   "weather_channel_index": 1,
   "weather_channel_name": "Weather",

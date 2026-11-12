@@ -73,14 +73,13 @@ Received: <UTC time, HH:MM:SS.mmm>
 Path: <raw route hashes, hop count, or unavailable>
 Region: <resolved MeshCore region, when supplied>
 Hops: <hop count, when known>
-Message Type: <Flood, Direct, TC Flood, or TC Direct when RF-log verified>
 Approx. direct distance: <miles> mi
-Route distance: <miles> mi[ (from 1st hop)]
+Route distance: <miles> mi
 ```
 
 ## `ping link`
 
-Same as `ping`, without the Received and Message Type lines, plus an analyzer link so
+Same as `ping`, without the Received line, plus an analyzer link so
 the reply usually fits in one message:
 
 ```text
@@ -89,18 +88,19 @@ Path: <raw route hashes, hop count, or unavailable>
 Region: <resolved MeshCore region, when supplied>
 Hops: <hop count, when known>
 Approx. direct distance: <miles> mi
-Route distance: <miles> mi[ (from 1st hop)]
+Route distance: <miles> mi
 https://analyzer.gulfcoastmesh.org/#/packet/<packet id>/route
 ```
 
 The link needs a channel ping matched to a raw RF frame; otherwise the last line is
 `Link: unavailable (DMs and unmatched packets)`.
 
-The route distance line adds up each leg from the sender through every repeater in the
-path to the bot. Repeater and sender locations come from the companion's contacts first,
-then from analyzer.gulfcoastmesh.org (channel pings only). If the sender's location is
-unknown the distance starts at the first repeater, marked `(from 1st hop)`. The line is
-left out if any repeater can't be located or an ID matches more than one node.
+The route distance line adds up each leg from the first repeater in the path to the
+last (at least two repeaters). Repeater locations come from the companion's contacts
+first, then from analyzer.gulfcoastmesh.org (channel pings only). The line is left out
+if any repeater can't be located or an ID matches more than one node; the bot log says
+why. The direct-distance line needs the bot's location: set one on the companion, or
+set `bot_latitude` and `bot_longitude` in `config.json`.
 
 The distance line is present only when the bot and a DM sender have advertised GPS
 coordinates. It is straight-line endpoint distance, not the distance through relays.
@@ -108,8 +108,6 @@ For `#test`, raw hashes are uppercase and dash-separated (for example, `AF-2B-8A
 `AF2B-8A10`); unmatched packets and DMs fall back to hop count.
 The region line is included only when the companion supplies an already-resolved region
 name; this bot does not attempt to reverse-map MeshCore transport codes.
-The message-type line is shown only for a channel packet that exactly matches an RF-log
-entry; DMs and unmatched channel packets omit it.
 
 ## NWS alert notification
 
