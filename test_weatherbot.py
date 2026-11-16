@@ -720,7 +720,7 @@ class OutgoingScopeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FakeBriefWeather:
-    async def weather_report(self, zip_code):
+    async def weather_report(self, zip_code, unit="F"):
         return f"WX {zip_code}: Clear, 72F."
 
     async def weather_api_all(self, zip_code):
@@ -1829,3 +1829,98 @@ class FishingLabelTests(unittest.TestCase):
         self.assertEqual(label("Golden Meadow"), "Golden Meadow 70357")
         self.assertEqual(label("Saint Martinville East"), "Saint Martinville 70357")
         self.assertEqual(label("70357"), "70357")
+
+
+class FakeSettingsWeather:
+    def __init__(self):
+        self.reports = []
+
+    async def resolve_zip(self, zip_code):
+        zip_code = weatherbot.normalize_zip(zip_code)
+        if zip_code == "00000":
+            raise weatherbot.WeatherError("ZIP code was not found")
+        return weatherbot.Location(zip_code, 30.4, -91.1, "Baton Rouge", "LA", None, None)
+
+    async def weather_report(self, zip_code, unit="F"):
+        self.reports.append((zip_code, unit))
+        return f"WX {zip_code} in {unit}"
+
+    async def weather_json(self, zip_code):
+        return {"z": zip_code, "t": 72}
+
+
+class UserSettingsTests(unittest.IsolatedAsyncioTestCase):
+    PREFIX = "313233343536"
+
+    def make_bot(self, state):
+        bot = weatherbot.WeatherBot(make_config(state), weather=FakeSettingsWeather())
+        bot._reply = AsyncMock()
+        return bot
+
+    async def send(self, bot, text, **kwargs):
+        if "channel_index" in kwargs:
+            kwargs.setdefault("required_region_match", True)
+        else:
+            kwargs.setdefault("sender_prefix", self.PREFIX)
+        handled = await bot.handle_message(
+            FakeMesh(FakeRoutingCommands()), weatherbot.InboundMessage(text, **kwargs)
+        )
+        self.assertTrue(handled)
+        return bot._reply.await_args.args[2]
+
+    async def test_dm_settings_persist_and_apply(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state.json"
+            bot = self.make_bot(state)
+            self.assertIn("No default ZIP", await self.send(bot, "wx"))
+            self.assertIn("°C", await self.send(bot, "wx settings set temp c"))
+            reply = await self.send(bot, "wx setting set defaultzip 70818-1234")
+            self.assertIn("70818 (Baton Rouge, LA)", reply)
+            self.assertEqual(bot._user_settings[self.PREFIX], {"temp": "C", "zip": "70818"})
+
+            restarted = self.make_bot(state)
+            self.assertEqual(await self.send(restarted, "wx"), "WX 70818 in C")
+            self.assertEqual(await self.send(restarted, "wx 60601"), "WX 60601 in C")
+            self.assertEqual(await self.send(restarted, "wx 60601 json"), {"z": "60601", "t": 72})
+            self.assertIn("°C, default ZIP 70818", await self.send(restarted, "wx settings"))
+
+            self.assertEqual(await self.send(restarted, "wx settings clear"), "WX settings cleared.")
+            self.assertNotIn(self.PREFIX, json.loads(state.read_text())["user_settings"])
+            self.assertEqual(await self.send(restarted, "wx 60601"), "WX 60601 in F")
+
+    async def test_invalid_settings_are_not_saved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot = self.make_bot(Path(directory) / "state.json")
+            self.assertIn("C or F", await self.send(bot, "wx settings set temp K"))
+            self.assertIn("5 digits", await self.send(bot, "wx settings set defaultzip 123"))
+            self.assertIn("not found", await self.send(bot, "wx settings set defaultzip 00000"))
+            self.assertEqual(bot._user_settings, {})
+
+    async def test_channel_uses_unique_contact_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot = self.make_bot(Path(directory) / "state.json")
+            bot._contacts[self.PREFIX] = {"public_key": self.PREFIX + "00" * 26, "adv_name": "Alice"}
+            reply = await self.send(bot, "Alice: wx settings set defaultzip 70818", channel_index=1)
+            self.assertIn("70818", reply)
+            await self.send(bot, "Alice: wx settings set temp C", channel_index=1)
+            self.assertEqual(bot._user_settings[self.PREFIX], {"zip": "70818", "temp": "C"})
+            self.assertEqual(await self.send(bot, "alice: wx", channel_index=1, sender_timestamp=1), "WX 70818 in C")
+            # DM and channel share one record.
+            self.assertEqual(await self.send(bot, "wx 60601"), "WX 60601 in C")
+
+            self.assertEqual(
+                await self.send(bot, "Bob: wx settings set temp C", channel_index=1),
+                weatherbot.SETTINGS_UNKNOWN_SENDER,
+            )
+            bot._contacts["aaaaaaaaaaaa"] = {"public_key": "aa" * 32, "adv_name": "Alice"}
+            self.assertIn("No default ZIP", await self.send(bot, "Alice: wx", channel_index=1, sender_timestamp=2))
+            self.assertEqual(await self.send(bot, "Alice: wx 60601", channel_index=1, sender_timestamp=3), "WX 60601 in F")
+
+    async def test_report_converts_to_celsius(self):
+        service = FakeWeatherService()
+        report = await service.weather_report("60601", unit="C")
+        self.assertIn("🌡️ 20°C", report)
+        self.assertIn("Feels like 25°C", report)
+        self.assertEqual(service.forecast_params["temperature_unit"], "fahrenheit")
+        self.assertEqual(weatherbot.format_temp(32, "C"), "0°C")
+        self.assertEqual(weatherbot.format_temp(71.6), "72°F")

@@ -44,6 +44,11 @@ WX_VERSION_COMMAND = re.compile(r"\s*wx\s+version(?:\s+(json))?\s*", re.IGNORECA
 WX_REPORT_COMMAND = re.compile(
     r"\s*wx\s+report\s+(stop|(\d{5})(?:-\d{4})?)(?:\s+(json))?\s*", re.IGNORECASE
 )
+WX_SETTINGS_COMMAND = re.compile(
+    r"\s*wx\s+settings?(?:\s+(?:(set)\s+(temp|defaultzip|zip)\s+(\S+)|(clear)|show))?\s*",
+    re.IGNORECASE,
+)
+WX_DEFAULT_COMMAND = re.compile(r"\s*wx(?:\s+(json))?\s*", re.IGNORECASE)
 PING_COMMAND = re.compile(r"\s*ping(?:\s+(json|link))?\s*", re.IGNORECASE)
 FISH_COMMAND = re.compile(
     r"\s*fish\s+(?:(tides?|water|wind|moon)\s+)?(\d{5})(?:-\d{4})?\s*", re.IGNORECASE
@@ -66,12 +71,21 @@ HELP_TEXT = (
     "wx ZIPCODE: weather report\n"
     "wx report ZIPCODE: DM alert signup\n"
     "wx report stop: stop DM alerts\n"
+    "wx: weather for your default ZIP\n"
+    "wx settings: show your settings\n"
+    "wx settings set temp C|F\n"
+    "wx settings set defaultzip ZIPCODE\n"
+    "wx settings clear: reset settings\n"
     "wx version: running Git commit\n"
     "fish ZIPCODE: #fishing report\n"
     "ping: DM or #test\n"
     "ping link: ping with analyzer link"
 )
 REPORT_STOP_TEXT = "To stop these alerts: wx report stop"
+DEFAULT_ZIP_HINT = "No default ZIP set. Set one with: wx settings set defaultzip ZIPCODE"
+SETTINGS_UNKNOWN_SENDER = (
+    "I couldn't match your name to a contact. Send an advert or use a DM."
+)
 UNKNOWN_SENDER_NOTICE = (
     "⚠️ This reply was flood-sent because I do not have your advert. "
     "Please send an advert for reliable future replies."
@@ -306,20 +320,20 @@ class WeatherService:
         )
         return [item for item in (data.get("features") or []) if isinstance(item, dict)]
 
-    async def weather_report(self, zip_code: str) -> str:
+    async def weather_report(self, zip_code: str, unit: str = "F") -> str:
         location = await self.resolve_zip(zip_code)
         current, _hourly = await self._forecast(location)
         lines = [f"☀️ {location.city}, {location.state} {location.zip_code}"]
         temperature = number_or_none(current.get("temperature_2m"))
         description = open_meteo_weather_description(current.get("weather_code"))
         if temperature is not None:
-            lines.append(f"🌡️ {round(temperature)}°F · {description}")
+            lines.append(f"🌡️ {format_temp(temperature, unit)} · {description}")
         else:
             lines.append(f"🌡️ {description}")
         stats: list[str] = []
         apparent = number_or_none(current.get("apparent_temperature"))
         if apparent is not None:
-            stats.append(f"☀️ Feels like {round(apparent)}°F")
+            stats.append(f"☀️ Feels like {format_temp(apparent, unit)}")
         humidity = number_or_none(current.get("relative_humidity_2m"))
         if humidity is not None:
             stats.append(f"💧 {round(humidity)}%")
@@ -447,6 +461,7 @@ class WeatherBot:
             self._seen_alerts,
             self._report_subscriptions,
             self._reported_alerts,
+            self._user_settings,
         ) = self._load_state()
 
     async def run_forever(self) -> None:
@@ -1169,10 +1184,30 @@ class WeatherBot:
             await self._reply(mesh, message, reply)
             return True
 
+        settings_match = WX_SETTINGS_COMMAND.fullmatch(command)
+        if settings_match:
+            await self._reply(mesh, message, await self._handle_settings(mesh, message, settings_match))
+            return True
+
         request = parse_wx_request(command)
+        default_match = None if request else WX_DEFAULT_COMMAND.fullmatch(command)
+        prefs: dict[str, str] = {}
+        if message.api_version != 2 and (request or default_match):
+            # Only a bare `wx` justifies asking the companion for fresh contacts.
+            prefix = await self._settings_prefix(
+                mesh, message, refresh=default_match is not None
+            )
+            if prefix is not None:
+                prefs = self._user_settings.get(prefix, {})
         if request is None:
-            return False
+            if default_match is None or message.api_version == 2:
+                return False
+            if "zip" not in prefs:
+                await self._reply(mesh, message, DEFAULT_ZIP_HINT)
+                return True
+            request = (prefs["zip"], bool(default_match.group(1)))
         zip_code, wants_json = request
+        unit = prefs.get("temp", "F")
 
         request_key = self._request_key(message)
         if request_key is not None:
@@ -1194,7 +1229,7 @@ class WeatherBot:
             report: str | dict[str, Any] = (
                 await self.weather.weather_json(zip_code)
                 if wants_json
-                else await self.weather.weather_report(zip_code)
+                else await self.weather.weather_report(zip_code, unit=unit)
             )
         except WeatherError as exc:
             report = (
@@ -1205,6 +1240,77 @@ class WeatherBot:
 
         await self._reply(mesh, message, report)
         return True
+
+    async def _settings_prefix(
+        self, mesh: Any, message: InboundMessage, refresh: bool = True
+    ) -> Optional[str]:
+        """Key a sender's settings: DM key prefix, or a unique contact name match."""
+        if not message.is_channel:
+            return message.sender_prefix[:12].lower() if message.sender_prefix else None
+        if ": " not in message.text:
+            return None
+        name = message.text.split(": ", 1)[0].strip().casefold()
+        if not name:
+            return None
+
+        def matches() -> list[str]:
+            return [
+                prefix for prefix, contact in self._contacts.items()
+                if str(contact.get("adv_name") or "").strip().casefold() == name
+            ]
+
+        found = matches()
+        if not found and refresh:
+            try:
+                async with self._mesh_lock:
+                    await self._refresh_contacts_unlocked(mesh)
+            except MeshError as exc:
+                LOG.warning("Could not refresh contacts for settings lookup: %s", exc)
+                return None
+            found = matches()
+        return found[0] if len(found) == 1 else None
+
+    async def _handle_settings(
+        self, mesh: Any, message: InboundMessage, match: re.Match[str]
+    ) -> str:
+        prefix = await self._settings_prefix(mesh, message)
+        if prefix is None:
+            return SETTINGS_UNKNOWN_SENDER
+        if match.group(4):
+            removed = self._user_settings.pop(prefix, None)
+            if removed:
+                self._save_state()
+            return "WX settings cleared." if removed else "You have no WX settings."
+        if match.group(1):
+            field = match.group(2).casefold()
+            value = match.group(3)
+            entry = dict(self._user_settings.get(prefix, {}))
+            if field == "temp":
+                unit = value.upper().lstrip("°")
+                if unit not in ("C", "F"):
+                    return "Temperature must be C or F: wx settings set temp C"
+                entry["temp"] = unit
+                reply = f"Temperature will show in °{unit}."
+            else:
+                if not re.fullmatch(r"\d{5}(?:-\d{4})?", value):
+                    return "ZIP must be 5 digits: wx settings set defaultzip ZIPCODE"
+                try:
+                    location = await self.weather.resolve_zip(normalize_zip(value))
+                except WeatherError as exc:
+                    return f"Could not set default ZIP: {exc}."
+                entry["zip"] = location.zip_code
+                reply = (
+                    f"Default ZIP set to {location.zip_code} "
+                    f"({location.city}, {location.state}). Send wx for weather."
+                )
+            self._user_settings[prefix] = entry
+            self._save_state()
+            return reply
+        entry = self._user_settings.get(prefix, {})
+        return (
+            f"Your WX settings: temp °{entry.get('temp', 'F')}, "
+            f"default ZIP {entry.get('zip', 'none')}"
+        )
 
     async def _handle_fish(
         self, mesh: Any, message: InboundMessage, match: re.Match[str]
@@ -1695,7 +1801,10 @@ class WeatherBot:
                 LOG.info("Sent NWS report alert to %s for ZIP(s) %s", prefix, ", ".join(matching_zips))
         return sent
 
-    def _load_state(self) -> tuple[dict[str, int], dict[str, list[str]], dict[str, dict[str, int]]]:
+    def _load_state(self) -> tuple[
+        dict[str, int], dict[str, list[str]], dict[str, dict[str, int]],
+        dict[str, dict[str, str]],
+    ]:
         try:
             with self.config.state_file.open("r", encoding="utf-8") as handle:
                 data = json.load(handle)
@@ -1721,12 +1830,27 @@ class WeatherBot:
                     reported[str(prefix).lower()[:12]] = {
                         str(key): int(value) for key, value in values.items()
                     }
-            return seen_alerts, subscriptions, reported
+            settings: dict[str, dict[str, str]] = {}
+            for prefix, values in (data.get("user_settings") or {}).items():
+                if not isinstance(values, dict):
+                    continue
+                entry: dict[str, str] = {}
+                temp = str(values.get("temp") or "").upper()
+                if temp in ("C", "F"):
+                    entry["temp"] = temp
+                if values.get("zip"):
+                    try:
+                        entry["zip"] = normalize_zip(str(values["zip"]))
+                    except WeatherError:
+                        pass
+                if entry:
+                    settings[str(prefix).lower()[:12]] = entry
+            return seen_alerts, subscriptions, reported, settings
         except FileNotFoundError:
             pass
         except (AttributeError, OSError, ValueError, TypeError) as exc:
             LOG.warning("Ignoring unreadable alert state: %s", exc)
-        return {}, {}, {}
+        return {}, {}, {}, {}
 
     def _save_state(self) -> None:
         self._seen_alerts = dict(list(self._seen_alerts.items())[-2000:])
@@ -1743,6 +1867,7 @@ class WeatherBot:
                     "seen_alerts": self._seen_alerts,
                     "report_subscriptions": self._report_subscriptions,
                     "reported_alerts": self._reported_alerts,
+                    "user_settings": self._user_settings,
                 },
                 handle,
                 indent=2,
@@ -2114,6 +2239,13 @@ def open_meteo_weather_description(value: Any) -> str:
         99: "Severe thunderstorm with hail",
     }
     return descriptions.get(code, "Unknown conditions")
+
+
+def format_temp(value_f: float, unit: str = "F") -> str:
+    """Format a Fahrenheit reading in the requested unit."""
+    if unit.upper() == "C":
+        return f"{round((value_f - 32) * 5 / 9)}°C"
+    return f"{round(value_f)}°F"
 
 
 def open_meteo_wind(data: dict[str, Any]) -> str:

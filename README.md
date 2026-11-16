@@ -53,6 +53,24 @@ region, or none, gets a reply (in the `#us-la-msy` scope) telling the sender to 
 `us-gc`; other chat is ignored. Packet verification uses the same transport-code check
 described below, with the key for `#us-gc`. All other channels keep `us-la-msy`.
 
+Personal settings are saved per user in the state file and work in a DM or in `#Weather`:
+
+| Command | Effect |
+| --- | --- |
+| `wx settings` | Show your settings |
+| `wx settings set temp C` (or `F`) | Show temperatures in °C or °F in text reports |
+| `wx settings set defaultzip ZIPCODE` | Save a default ZIP (it is checked first) |
+| `wx` | Weather for your default ZIP |
+| `wx settings clear` | Remove all of your settings |
+
+In a DM, settings are keyed by your public key. Channel messages carry only a display
+name, so in `#Weather` the bot finds your key by matching your name to one of its
+contacts' advertised names (case-insensitive). If no contact matches, or several
+share the name, nothing is applied or saved; send an advert or use a DM. Name matching
+can be spoofed: anyone using your display name on the channel can view or change your
+settings. The temperature unit applies only to human-readable reports; `json`, API v1/v2
+and alerts stay in °F.
+
 Use `wx report ZIPCODE` in a DM to subscribe that identity to NOAA alerts for a ZIP;
 repeat it to add more ZIPs. Every report alert is sent by DM and ends with
 `wx report stop`, which removes all of that identity's subscriptions. In `#Weather`,
