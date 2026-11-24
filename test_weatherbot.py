@@ -1432,14 +1432,14 @@ class CommandFeatureTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             compact,
-            "@[Alice] 🏓 Pong\nPath: AA-BB\nHops: 2\n" + url,
+            "@[Alice] 🏓 Pong\n" + url,
         )
         one_message = weatherbot.InboundMessage(
             "Alice: ping", channel_index=2, path="ab" * 10, path_hash_mode=1,
             region="us-gulf", packet_hash="b33b67bd6d8b2b3d",
         )
         reply = weatherbot.format_ping_response(one_message, link=True)
-        self.assertGreater(len(reply.encode("utf-8")), 130)
+        self.assertEqual(reply, "@[Alice] 🏓 Pong\n" + url)
         self.assertEqual(weatherbot.split_mesh_text(reply), [reply])
         self.assertEqual(
             weatherbot.PING_COMMAND.fullmatch("PING Link").group(1).lower(), "link"

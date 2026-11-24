@@ -79,16 +79,10 @@ Route distance: <miles> mi
 
 ## `ping link`
 
-Same as `ping`, without the Received line, plus an analyzer link so
-the reply usually fits in one message:
+Only the pong and an analyzer link, with no route or time details:
 
 ```text
 @[<user>] 🏓 Pong
-Path: <raw route hashes, hop count, or unavailable>
-Region: <resolved MeshCore region, when supplied>
-Hops: <hop count, when known>
-Approx. direct distance: <miles> mi
-Route distance: <miles> mi
 https://analyzer.gulfcoastmesh.org/#/packet/<packet id>/route
 ```
 

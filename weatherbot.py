@@ -2100,13 +2100,16 @@ def ping_response_data(message: InboundMessage) -> dict[str, Any]:
 
 
 def format_ping_response(message: InboundMessage, link: bool = False) -> str:
-    """Format a pong; `link` drops the time to fit the analyzer URL in one message."""
-    data = ping_response_data(message)
+    """Format a pong; `link` replies with only the pong and the analyzer URL."""
     response = f"{requester_mention(message)} 🏓 Pong\n"
-    if not link:
-        received = message.received_at or datetime.now(tz=ZoneInfo("UTC"))
-        received_time = received.astimezone(ZoneInfo("UTC")).strftime("%H:%M:%S.%f")[:12]
-        response += f"Received: {received_time} UTC\n"
+    if link:
+        if message.packet_hash:
+            return response + ANALYZER_PACKET_URL.format(message.packet_hash)
+        return response + "Link: unavailable (DMs and unmatched packets)"
+    data = ping_response_data(message)
+    received = message.received_at or datetime.now(tz=ZoneInfo("UTC"))
+    received_time = received.astimezone(ZoneInfo("UTC")).strftime("%H:%M:%S.%f")[:12]
+    response += f"Received: {received_time} UTC\n"
     response += f"Path: {data['path']}"
     if message.region:
         response += f"\nRegion: {message.region}"
@@ -2117,11 +2120,6 @@ def format_ping_response(message: InboundMessage, link: bool = False) -> str:
         response += f"\nApprox. direct distance: {data['approx_direct_miles']:.1f} mi"
     if message.route_miles is not None:
         response += f"\nRoute distance: {message.route_miles:.1f} mi"
-    if link:
-        if message.packet_hash:
-            response += f"\n{ANALYZER_PACKET_URL.format(message.packet_hash)}"
-        else:
-            response += "\nLink: unavailable (DMs and unmatched packets)"
     return response
 
 
